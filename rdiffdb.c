@@ -85,7 +85,7 @@ int main(int argc, char **argv) {
    // We can't bind an inline set like we would want in "WHERE x NOT IN ?", so
    // instead we use a temporary table.
    sqlite3_exec(
-      db, "CREATE TEMPORARY TABLE temp.inodes (inode INTEGER NOT NULL)",
+      db, "CREATE TEMPORARY TABLE temp.inodes (inode INTEGER PRIMARY KEY)",
       NULL, NULL, &errmsg);
    if (errmsg) return fail_sql("creating temporary table", errmsg);
 
@@ -111,7 +111,8 @@ int main(int argc, char **argv) {
    err = sqlite3_prepare_v2(
       db,
       "DELETE FROM paths "
-      "WHERE parent_inode IS ? AND inode NOT IN (SELECT * FROM temp.inodes)",
+      "WHERE parent_inode IS ? AND "
+         "NOT EXISTS (SELECT 1 FROM temp.inodes WHERE inode = paths.inode)",
       -1, &delete_stmt, NULL);
    if (err)
       return fail_sql("preparing DELETE", sqlite3_errstr(err));
