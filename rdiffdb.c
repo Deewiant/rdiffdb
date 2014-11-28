@@ -56,8 +56,6 @@ int main(int argc, char **argv) {
    if (errmsg) return fail_sql("setting pragma", errmsg);
    sqlite3_exec(db, "PRAGMA encoding = \"UTF-8\"", NULL, NULL, &errmsg);
    if (errmsg) return fail_sql("setting pragma", errmsg);
-   sqlite3_exec(db, "PRAGMA foreign_keys = ON", NULL, NULL, &errmsg);
-   if (errmsg) return fail_sql("setting pragma", errmsg);
    sqlite3_exec(db, "PRAGMA temp_store = MEMORY", NULL, NULL, &errmsg);
    if (errmsg) return fail_sql("setting pragma", errmsg);
 
@@ -65,7 +63,10 @@ int main(int argc, char **argv) {
       db,
       "CREATE TABLE IF NOT EXISTS paths ("
       "inode INTEGER UNIQUE NOT NULL,"
-      "parent_inode INTEGER REFERENCES paths(inode),"
+      // Theoretically this should have a foreign key constraint to the above,
+      // but doing this allows doing recursive deletes bottom-up instead of
+      // top-down.
+      "parent_inode INTEGER,"
       "name TEXT NOT NULL,"
       "mode INTEGER NOT NULL,"
       "uid INTEGER NOT NULL,"
@@ -155,6 +156,14 @@ int main(int argc, char **argv) {
             temp_truncate_stmt);
    if (err)
       return err;
+
+   // Complete any unfinished recursive deletions.
+   do {
+      sqlite3_exec(db, "DELETE FROM paths "
+                       "WHERE parent_inode NOT IN (SELECT inode FROM paths)",
+                   NULL, NULL, &errmsg);
+      if (errmsg) return fail_sql("deleting recursively", errmsg);
+   } while (sqlite3_changes(db));
 
    sqlite3_exec(db, "COMMIT", NULL, NULL, &errmsg);
    if (errmsg) return fail_sql("committing", errmsg);
