@@ -314,7 +314,7 @@ static int go(
          : sqlite3_bind_null(select_stmt, 1);
       CHECK_BIND("SELECT");
       err = sqlite3_bind_text(select_stmt, 2, entry->d_name, entry_name_len,
-                              SQLITE_TRANSIENT);
+                              SQLITE_STATIC);
       CHECK_BIND("SELECT");
 
       err = sqlite3_step(select_stmt);
@@ -381,7 +381,7 @@ static int go(
          : sqlite3_bind_null(insert_stmt, 2);
       CHECK_BIND("INSERT");
       err = sqlite3_bind_text(insert_stmt, 3, entry->d_name,
-                              entry_name_len, SQLITE_TRANSIENT);
+                              entry_name_len, SQLITE_STATIC);
       CHECK_BIND("INSERT");
       err = sqlite3_bind_int(insert_stmt, 4, st.st_mode);
       CHECK_BIND("INSERT");
