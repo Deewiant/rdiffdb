@@ -137,7 +137,7 @@ int main(int argc, char **argv) {
       return 1;
    }
 
-   long name_max = pathconf(".", _PC_NAME_MAX);
+   long name_max = fpathconf(root_fd, _PC_NAME_MAX);
    if (name_max == -1)
       name_max = NAME_MAX;
    struct dirent *entry =
