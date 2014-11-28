@@ -24,7 +24,7 @@ static int fail_sql(const char *action, const char *errmsg) {
 static int go(
    char *dirpath, const size_t dirpath_len, size_t dirpath_cap,
    const int dirfd, const ino_t dir_inode, DIR *dir, struct dirent *entry,
-   long name_max,
+   long name_max, char *entry_link_target, size_t entry_link_target_cap,
    sqlite3 *db,
    sqlite3_stmt *select_stmt,
    sqlite3_stmt *insert_stmt,
@@ -146,9 +146,11 @@ int main(int argc, char **argv) {
 
    const long path_max = fpathconf(root_fd, _PC_PATH_MAX);
    const size_t dirpath_cap = path_max == -1 ? PATH_MAX : path_max;
+   const size_t link_target_buf_cap = dirpath_cap;
    char *dirpath = malloc(dirpath_cap);
+   char *link_target_buf = malloc(link_target_buf_cap);
 
-   if (!entry || !dirpath) {
+   if (!entry || !dirpath || !link_target_buf) {
       perror("malloc");
       return 4;
    }
@@ -158,9 +160,9 @@ int main(int argc, char **argv) {
    sqlite3_exec(db, "BEGIN IMMEDIATE TRANSACTION", NULL, NULL, &errmsg);
    if (errmsg) return fail_sql("beginning transaction", errmsg);
 
-   err = go(dirpath, 0, dirpath_cap, root_fd, 0, root_dir, entry, name_max, db,
-            select_stmt, insert_stmt, delete_stmt, temp_insert_stmt,
-            temp_truncate_stmt);
+   err = go(dirpath, 0, dirpath_cap, root_fd, 0, root_dir, entry, name_max,
+            link_target_buf, link_target_buf_cap, db, select_stmt, insert_stmt,
+            delete_stmt, temp_insert_stmt, temp_truncate_stmt);
    if (err)
       return err;
 
@@ -179,7 +181,7 @@ int main(int argc, char **argv) {
 static int go(
    char *dirpath, const size_t dirpath_len, size_t dirpath_cap,
    const int dirfd, const ino_t dir_inode, DIR *dir, struct dirent *entry,
-   long name_max,
+   long name_max, char *entry_link_target, size_t entry_link_target_cap,
    sqlite3 *db,
    sqlite3_stmt *select_stmt,
    sqlite3_stmt *insert_stmt,
@@ -256,8 +258,7 @@ static int go(
 
       // This may be somewhat overkill since we don't even handle files
       // disappearing out from under us, but oh well.
-      char *entry_link_target = NULL;
-      int entry_link_len = 0;
+      int entry_link_len;
       for (;;) {
          if ((fd == -1
                  ? fstatat(dirfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW)
@@ -272,14 +273,19 @@ static int go(
          if (!S_ISLNK(st.st_mode))
             break;
 
-         entry_link_target = realloc(entry_link_target, st.st_size + 1);
-         if (!entry_link_target) {
-            perror("realloc");
-            return 4;
+         if (st.st_size >= entry_link_target_cap) {
+            entry_link_target_cap *= 2;
+            entry_link_target =
+               realloc(entry_link_target, entry_link_target_cap);
+            if (!entry_link_target) {
+               perror("realloc");
+               return 4;
+            }
          }
 
-         const ssize_t len = readlinkat(dirfd, entry->d_name,
-                                        entry_link_target, st.st_size + 1);
+         const ssize_t len =
+            readlinkat(dirfd, entry->d_name, entry_link_target,
+                       entry_link_target_cap);
          if (len == -1) {
             fprintf(stderr, "readlinkat('%s', '%s'): %s\n",
                     dirpath, entry->d_name, strerror(errno));
@@ -290,12 +296,12 @@ static int go(
                     dirpath, entry->d_name, len);
             return 1;
          }
-         entry_link_len = (int)len;
          if (len != st.st_size) {
             // Link's target changed to a different one between the
             // fstat/fstatat and the readlinkat, so update all info.
             continue;
          }
+         entry_link_len = (int)len;
          entry_link_target[entry_link_len] = '\0';
          break;
       }
@@ -422,7 +428,7 @@ static int go(
       CHECK_BIND("INSERT");
       err = S_ISLNK(st.st_mode)
                ? sqlite3_bind_text(insert_stmt, 11, entry_link_target,
-                                   entry_link_len, free)
+                                   entry_link_len, SQLITE_STATIC)
                : sqlite3_bind_null(insert_stmt, 11);
       CHECK_BIND("INSERT");
       err = S_ISBLK(st.st_mode) || S_ISCHR(st.st_mode)
@@ -445,7 +451,8 @@ static int go(
       }
 
       err = go(entry_path, entry_path_len, dirpath_cap, fd, st.st_ino,
-               entry_dir, entry, name_max, db, select_stmt, insert_stmt,
+               entry_dir, entry, name_max, entry_link_target,
+               entry_link_target_cap, db, select_stmt, insert_stmt,
                delete_stmt, temp_insert_stmt, temp_truncate_stmt);
       if (err)
          return err;
