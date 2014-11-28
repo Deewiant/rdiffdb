@@ -203,6 +203,17 @@ static int go(
       if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
          continue;
 
+      int entry_name_len;
+      {
+         const size_t len = strlen(entry->d_name);
+         if (len > (size_t)INT_MAX) {
+            fprintf(stderr, "Name of inode %ju in '%s' too long %zd\n",
+                    (uintmax_t)entry->d_ino, dirpath, len);
+            return 1;
+         }
+         entry_name_len = (int)len;
+      }
+
       if (inodes_len == inodes_cap) {
          inodes_cap = 2*inodes_cap + 1024;
          inodes = realloc(inodes, inodes_cap * sizeof *inodes);
@@ -284,12 +295,10 @@ static int go(
          close(fd);
       }
 
-      int entry_name_len = -1;
       char *entry_path = NULL;
       size_t entry_path_size;
       if (S_ISDIR(st.st_mode)) {
          const bool need_slash = dirpath_size > 1;
-         entry_name_len = (int)strlen(entry->d_name);
          entry_path_size = dirpath_size + (need_slash?1:0) + entry_name_len;
          entry_path = malloc(entry_path_size);
          if (!entry_path) {
