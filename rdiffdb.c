@@ -45,22 +45,31 @@ int main(int argc, char **argv) {
 
    const char *db_path = argv[1];
 
-   sqlite3 *db;
-   int err = sqlite3_open(db_path, &db);
+   sqlite3 *diskdb;
+   int err = sqlite3_open(db_path, &diskdb);
    if (err) {
       fprintf(stderr, "Error opening DB at '%s': %s\n",
               db_path, sqlite3_errstr(err));
       return 3;
    }
 
+   sqlite3 *db;
+   err = sqlite3_open(":memory:", &db);
+   if (err)
+      return fail_sql("creating in-memory DB", sqlite3_errstr(err));
+
+   sqlite3_backup *bak = sqlite3_backup_init(db, "main", diskdb, "main");
+   if (!bak)
+      return fail_sql("initing DB load", sqlite3_errmsg(db));
+
+   err = sqlite3_backup_step(bak, -1);
+   if (err != SQLITE_DONE)
+      return fail_sql("loading DB to memory", sqlite3_errmsg(db));
+
+   sqlite3_backup_finish(bak);
+
    char *errmsg;
-   sqlite3_exec(db, "PRAGMA journal_mode = MEMORY", NULL, NULL, &errmsg);
-   if (errmsg) return fail_sql("setting pragma", errmsg);
-   sqlite3_exec(db, "PRAGMA synchronous = OFF", NULL, NULL, &errmsg);
-   if (errmsg) return fail_sql("setting pragma", errmsg);
    sqlite3_exec(db, "PRAGMA encoding = \"UTF-8\"", NULL, NULL, &errmsg);
-   if (errmsg) return fail_sql("setting pragma", errmsg);
-   sqlite3_exec(db, "PRAGMA temp_store = MEMORY", NULL, NULL, &errmsg);
    if (errmsg) return fail_sql("setting pragma", errmsg);
 
    sqlite3_exec(
@@ -182,6 +191,14 @@ int main(int argc, char **argv) {
 
    sqlite3_exec(db, "COMMIT", NULL, NULL, &errmsg);
    if (errmsg) return fail_sql("committing", errmsg);
+
+   bak = sqlite3_backup_init(diskdb, "main", db, "main");
+   if (!bak)
+      return fail_sql("initing DB save", sqlite3_errmsg(db));
+
+   err = sqlite3_backup_step(bak, -1);
+   if (err != SQLITE_DONE)
+      return fail_sql("saving DB to disk", sqlite4_errmsg(db));
 }
 
 static int go(
