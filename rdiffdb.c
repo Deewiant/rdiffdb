@@ -16,6 +16,8 @@
 
 #include <sqlite3.h>
 
+#define ANALYZE_FREQUENCY_FACTOR 4
+
 static int fail_sql(const char *action, const char *errmsg) {
    fprintf(stderr, "Error %s: %s\n", action, errmsg);
    return 4;
@@ -26,6 +28,7 @@ static int go(
    const int dirfd, const ino_t dir_inode, DIR *dir, struct dirent *entry,
    long name_max, char *entry_link_target, size_t entry_link_target_cap,
    dev_t *seen_devs, size_t seen_devs_count, size_t seen_devs_cap,
+   unsigned insertions, unsigned next_analysis,
    sqlite3 *db,
    sqlite3_stmt *select_stmt,
    sqlite3_stmt *insert_stmt,
@@ -163,8 +166,9 @@ int main(int argc, char **argv) {
    if (errmsg) return fail_sql("beginning transaction", errmsg);
 
    err = go(dirpath, 0, dirpath_cap, root_fd, 0, root_dir, entry, name_max,
-            link_target_buf, link_target_buf_cap, NULL, 0, 0, db, select_stmt,
-            insert_stmt, delete_stmt, temp_insert_stmt, temp_truncate_stmt);
+            link_target_buf, link_target_buf_cap, NULL, 0, 0, 0,
+            ANALYZE_FREQUENCY_FACTOR, db, select_stmt, insert_stmt,
+            delete_stmt, temp_insert_stmt, temp_truncate_stmt);
    if (err)
       return err;
 
@@ -185,6 +189,7 @@ static int go(
    const int dirfd, const ino_t dir_inode, DIR *dir, struct dirent *entry,
    long name_max, char *entry_link_target, size_t entry_link_target_cap,
    dev_t *seen_devs, size_t seen_devs_count, size_t seen_devs_cap,
+   unsigned insertions, unsigned next_analysis,
    sqlite3 *db,
    sqlite3_stmt *select_stmt,
    sqlite3_stmt *insert_stmt,
@@ -434,6 +439,13 @@ static int go(
          return fail_sql("stepping INSERT", sqlite3_errstr(err));
       sqlite3_reset(insert_stmt);
 
+      if (++insertions == next_analysis) {
+         next_analysis *= ANALYZE_FREQUENCY_FACTOR;
+         char *errmsg;
+         sqlite3_exec(db, "ANALYZE paths", NULL, NULL, &errmsg);
+         if (errmsg) return fail_sql("analyzing", errmsg);
+      }
+
       if (!S_ISDIR(st.st_mode))
          continue;
 
@@ -477,8 +489,8 @@ static int go(
       err = go(entry_path, entry_path_len, dirpath_cap, fd, st.st_ino,
                entry_dir, entry, name_max, entry_link_target,
                entry_link_target_cap, seen_devs, seen_devs_count,
-               seen_devs_cap, db, select_stmt, insert_stmt, delete_stmt,
-               temp_insert_stmt, temp_truncate_stmt);
+               seen_devs_cap, insertions, next_analysis, db, select_stmt,
+               insert_stmt, delete_stmt, temp_insert_stmt, temp_truncate_stmt);
       if (err)
          return err;
       closedir(entry_dir);
