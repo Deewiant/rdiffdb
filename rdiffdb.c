@@ -213,38 +213,40 @@ static int go(
       }
       inodes[inodes_len++] = entry->d_ino;
 
-      int oflags = O_NOATIME | O_NOFOLLOW | O_RDONLY;
-      if (entry->d_type == DT_DIR)
-         oflags |= O_DIRECTORY;
-
-      int fd = openat(dirfd, entry->d_name, oflags);
-      if (fd == -1) {
-         // Note: a possible reason is EPERM due to O_NOATIME, since it
-         // requires write permissions.
-         fprintf(stderr, "openat('%s', '%s', %#x): %s\n",
-                 dirpath, entry->d_name, oflags, strerror(errno));
-         return 1;
-      }
-
       struct stat st;
+      int fd = -1;
+
+      if (entry->d_type == DT_DIR || entry->d_type == DT_UNKNOWN) {
+         // It might be a directory: use openat, and fstat later.
+
+         const int oflags =
+            (entry->d_type == DT_DIR ? O_DIRECTORY : 0) |
+            O_CLOEXEC | O_NOATIME | O_NOFOLLOW | O_RDONLY;
+
+         fd = openat(dirfd, entry->d_name, oflags);
+         if (fd == -1) {
+            // Note: a possible reason is EPERM due to O_NOATIME, since it
+            // requires write permissions.
+            fprintf(stderr, "openat('%s', '%s', %#x): %s\n",
+                    dirpath, entry->d_name, oflags, strerror(errno));
+            return 1;
+         }
+      }
 
       // This may be somewhat overkill since we don't even handle files
       // disappearing out from under us, but oh well.
       char *entry_link_target = NULL;
       int entry_link_len = 0;
       for (;;) {
-         do_fstat:
-         if (fstat(fd, &st) == -1) {
-            fprintf(stderr, "fstat('%s'/'%s'): %s\n",
+         if ((fd == -1
+                 ? fstatat(dirfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW)
+                 : fstat(fd, &st)) == -1)
+         {
+            fprintf(stderr, fd == -1 ? "fstatat('%s', '%s'): %s\n"
+                                     : "fstat('%s'/'%s'): %s\n",
                     dirpath, entry->d_name, strerror(errno));
             return 1;
          }
-
-         if (S_ISDIR(st.st_mode))
-            break;
-
-         // We only needed it for the fstat, so get rid of it.
-         close(fd);
 
          if (!S_ISLNK(st.st_mode))
             break;
@@ -254,28 +256,32 @@ static int go(
             perror("realloc");
             return 4;
          }
-         for (;;) {
-            const ssize_t len = readlinkat(dirfd, entry->d_name,
-                                           entry_link_target, st.st_size + 1);
-            if (len == -1) {
-               fprintf(stderr, "readlinkat('%s', '%s'): %s\n",
-                       dirpath, entry->d_name, strerror(errno));
-               return 1;
-            }
-            if (len > (ssize_t)INT_MAX) {
-               fprintf(stderr, "readlinkat('%s', '%s'): too long %zd\n",
-                       dirpath, entry->d_name, len);
-               return 1;
-            }
-            entry_link_len = (int)len;
-            if (entry_link_len != st.st_size)
-               break;
 
-            // Link's target changed to a different one, so update all info.
-            goto do_fstat;
+         const ssize_t len = readlinkat(dirfd, entry->d_name,
+                                        entry_link_target, st.st_size + 1);
+         if (len == -1) {
+            fprintf(stderr, "readlinkat('%s', '%s'): %s\n",
+                    dirpath, entry->d_name, strerror(errno));
+            return 1;
+         }
+         if (len > (ssize_t)INT_MAX) {
+            fprintf(stderr, "readlinkat('%s', '%s'): too long %zd\n",
+                    dirpath, entry->d_name, len);
+            return 1;
+         }
+         entry_link_len = (int)len;
+         if (len != st.st_size) {
+            // Link's target changed to a different one between the
+            // fstat/fstatat and the readlinkat, so update all info.
+            continue;
          }
          entry_link_target[entry_link_len] = '\0';
          break;
+      }
+
+      if (fd != -1 && !S_ISDIR(st.st_mode)) {
+         // We only needed it for the fstat, so get rid of it.
+         close(fd);
       }
 
       int entry_name_len = -1;
