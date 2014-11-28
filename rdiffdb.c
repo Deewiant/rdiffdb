@@ -22,8 +22,9 @@ static int fail_sql(const char *action, const char *errmsg) {
 }
 
 static int go(
-   const char *dirpath, const size_t dirpath_size, const int dirfd,
-   const ino_t dir_inode, DIR *dir, struct dirent *entry, long name_max,
+   char *dirpath, const size_t dirpath_len, size_t dirpath_cap,
+   const int dirfd, const ino_t dir_inode, DIR *dir, struct dirent *entry,
+   long name_max,
    sqlite3 *db,
    sqlite3_stmt *select_stmt,
    sqlite3_stmt *insert_stmt,
@@ -142,16 +143,24 @@ int main(int argc, char **argv) {
       name_max = NAME_MAX;
    struct dirent *entry =
       malloc(offsetof(struct dirent, d_name) + name_max + 1);
-   if (!entry) {
+
+   const long path_max = fpathconf(root_fd, _PC_PATH_MAX);
+   const size_t dirpath_cap = path_max == -1 ? PATH_MAX : path_max;
+   char *dirpath = malloc(dirpath_cap);
+
+   if (!entry || !dirpath) {
       perror("malloc");
       return 4;
    }
 
+   strcpy(dirpath, "");
+
    sqlite3_exec(db, "BEGIN IMMEDIATE TRANSACTION", NULL, NULL, &errmsg);
    if (errmsg) return fail_sql("beginning transaction", errmsg);
 
-   err = go("", 1, root_fd, 0, root_dir, entry, name_max, db, select_stmt,
-            insert_stmt, delete_stmt, temp_insert_stmt, temp_truncate_stmt);
+   err = go(dirpath, 0, dirpath_cap, root_fd, 0, root_dir, entry, name_max, db,
+            select_stmt, insert_stmt, delete_stmt, temp_insert_stmt,
+            temp_truncate_stmt);
    if (err)
       return err;
 
@@ -168,8 +177,9 @@ int main(int argc, char **argv) {
 }
 
 static int go(
-   const char *dirpath, const size_t dirpath_size, const int dirfd,
-   const ino_t dir_inode, DIR *dir, struct dirent *entry, long name_max,
+   char *dirpath, const size_t dirpath_len, size_t dirpath_cap,
+   const int dirfd, const ino_t dir_inode, DIR *dir, struct dirent *entry,
+   long name_max,
    sqlite3 *db,
    sqlite3_stmt *select_stmt,
    sqlite3_stmt *insert_stmt,
@@ -296,21 +306,25 @@ static int go(
       }
 
       char *entry_path = NULL;
-      size_t entry_path_size;
+      size_t entry_path_len;
       if (S_ISDIR(st.st_mode)) {
-         const bool need_slash = dirpath_size > 1;
-         entry_path_size = dirpath_size + (need_slash?1:0) + entry_name_len;
-         entry_path = malloc(entry_path_size);
-         if (!entry_path) {
-            perror("malloc");
-            return 4;
+         // Reäppropriate dirpath as a buffer for this entry's path.
+         const bool need_slash = dirpath_len != 0;
+         const size_t dir_slashed_len = dirpath_len + (need_slash ? 1 : 0);
+         entry_path_len = dir_slashed_len + entry_name_len;
+         if (entry_path_len >= dirpath_cap) {
+            dirpath_cap = entry_path_len + 1 + name_max;
+            dirpath = realloc(dirpath, dirpath_cap);
+            if (!dirpath) {
+               perror("realloc");
+               return 4;
+            }
          }
-         memcpy(entry_path, dirpath, dirpath_size);
+         entry_path = dirpath;
          if (need_slash)
-            entry_path[dirpath_size - 1] = '/';
-         memcpy(entry_path + dirpath_size - (need_slash?0:1),
-                entry->d_name, entry_name_len);
-         entry_path[dirpath_size + entry_name_len - (need_slash?0:1)] = '\0';
+            entry_path[dirpath_len] = '/';
+         memcpy(entry_path + dir_slashed_len, entry->d_name, entry_name_len);
+         entry_path[dir_slashed_len + entry_name_len] = '\0';
       }
 
 #define CHECK_BIND(x) do { \
@@ -318,7 +332,7 @@ static int go(
          return fail_sql("binding to " x, sqlite3_errstr(err)); \
 } while (0)
       int err;
-      err = *dirpath
+      err = dirpath_len
          ? sqlite3_bind_int64(select_stmt, 1, dir_inode)
          : sqlite3_bind_null(select_stmt, 1);
       CHECK_BIND("SELECT");
@@ -385,7 +399,7 @@ static int go(
 
       err = sqlite3_bind_int64(insert_stmt, 1, st.st_ino);
       CHECK_BIND("INSERT");
-      err = *dirpath
+      err = dirpath_len
          ? sqlite3_bind_int64(insert_stmt, 2, dir_inode)
          : sqlite3_bind_null(insert_stmt, 2);
       CHECK_BIND("INSERT");
@@ -430,13 +444,13 @@ static int go(
          return 1;
       }
 
-      err = go(entry_path, entry_path_size, fd, st.st_ino, entry_dir, entry,
-               name_max, db, select_stmt, insert_stmt, delete_stmt,
-               temp_insert_stmt, temp_truncate_stmt);
+      err = go(entry_path, entry_path_len, dirpath_cap, fd, st.st_ino,
+               entry_dir, entry, name_max, db, select_stmt, insert_stmt,
+               delete_stmt, temp_insert_stmt, temp_truncate_stmt);
       if (err)
          return err;
-      free(entry_path);
       closedir(entry_dir);
+      entry_path[dirpath_len] = '\0';
    }
 
    int err;
@@ -450,7 +464,7 @@ static int go(
    }
    free(inodes);
 
-   err = *dirpath
+   err = dirpath_len
       ? sqlite3_bind_int64(delete_stmt, 1, dir_inode)
       : sqlite3_bind_null(delete_stmt, 1);
    CHECK_BIND("DELETE");
