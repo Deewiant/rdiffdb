@@ -25,6 +25,7 @@ static int go(
    char *dirpath, const size_t dirpath_len, size_t dirpath_cap,
    const int dirfd, const ino_t dir_inode, DIR *dir, struct dirent *entry,
    long name_max, char *entry_link_target, size_t entry_link_target_cap,
+   dev_t *seen_devs, size_t seen_devs_count, size_t seen_devs_cap,
    sqlite3 *db,
    sqlite3_stmt *select_stmt,
    sqlite3_stmt *insert_stmt,
@@ -161,8 +162,8 @@ int main(int argc, char **argv) {
    if (errmsg) return fail_sql("beginning transaction", errmsg);
 
    err = go(dirpath, 0, dirpath_cap, root_fd, 0, root_dir, entry, name_max,
-            link_target_buf, link_target_buf_cap, db, select_stmt, insert_stmt,
-            delete_stmt, temp_insert_stmt, temp_truncate_stmt);
+            link_target_buf, link_target_buf_cap, NULL, 0, 0, db, select_stmt,
+            insert_stmt, delete_stmt, temp_insert_stmt, temp_truncate_stmt);
    if (err)
       return err;
 
@@ -182,6 +183,7 @@ static int go(
    char *dirpath, const size_t dirpath_len, size_t dirpath_cap,
    const int dirfd, const ino_t dir_inode, DIR *dir, struct dirent *entry,
    long name_max, char *entry_link_target, size_t entry_link_target_cap,
+   dev_t *seen_devs, size_t seen_devs_count, size_t seen_devs_cap,
    sqlite3 *db,
    sqlite3_stmt *select_stmt,
    sqlite3_stmt *insert_stmt,
@@ -189,16 +191,6 @@ static int go(
    sqlite3_stmt *temp_insert_stmt,
    sqlite3_stmt *temp_truncate_stmt)
 {
-   const long new_name_max = pathconf(dirpath, _PC_NAME_MAX);
-   if (new_name_max > name_max) {
-      name_max = new_name_max;
-      entry = realloc(entry, offsetof(struct dirent, d_name) + name_max + 1);
-      if (!entry) {
-         perror("realloc");
-         return 4;
-      }
-   }
-
    ino_t *inodes = NULL;
    size_t inodes_len = 0, inodes_cap = 0;
 
@@ -450,10 +442,42 @@ static int go(
          return 1;
       }
 
+      bool seen_dev = false;
+      for (size_t i = 0; i < seen_devs_count; ++i) {
+         if (seen_devs[i] == st.st_dev) {
+            seen_dev = true;
+            break;
+         }
+      }
+
+      if (!seen_dev) {
+         if (seen_devs_count == seen_devs_cap) {
+            seen_devs_cap += 16;
+            seen_devs = realloc(seen_devs, seen_devs_cap * sizeof *seen_devs);
+            if (!seen_devs) {
+               perror("realloc");
+               return 4;
+            }
+         }
+         seen_devs[seen_devs_count++] = st.st_dev;
+
+         const long new_name_max = fpathconf(fd, _PC_NAME_MAX);
+         if (new_name_max > name_max) {
+            name_max = new_name_max;
+            entry =
+               realloc(entry, offsetof(struct dirent, d_name) + name_max + 1);
+            if (!entry) {
+               perror("realloc");
+               return 4;
+            }
+         }
+      }
+
       err = go(entry_path, entry_path_len, dirpath_cap, fd, st.st_ino,
                entry_dir, entry, name_max, entry_link_target,
-               entry_link_target_cap, db, select_stmt, insert_stmt,
-               delete_stmt, temp_insert_stmt, temp_truncate_stmt);
+               entry_link_target_cap, seen_devs, seen_devs_count,
+               seen_devs_cap, db, select_stmt, insert_stmt, delete_stmt,
+               temp_insert_stmt, temp_truncate_stmt);
       if (err)
          return err;
       closedir(entry_dir);
