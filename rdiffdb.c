@@ -23,8 +23,7 @@ static int fail_sql(const char *action, const char *errmsg) {
 
 static int go(
    const char *dirpath, const size_t dirpath_size, const int dirfd,
-   const ino_t dir_inode, DIR *dir, bool dir_was_new, struct dirent *entry,
-   long name_max,
+   const ino_t dir_inode, DIR *dir, struct dirent *entry, long name_max,
    sqlite3 *db,
    sqlite3_stmt *select_stmt,
    sqlite3_stmt *insert_stmt,
@@ -151,9 +150,8 @@ int main(int argc, char **argv) {
    sqlite3_exec(db, "BEGIN IMMEDIATE TRANSACTION", NULL, NULL, &errmsg);
    if (errmsg) return fail_sql("beginning transaction", errmsg);
 
-   err = go("", 1, root_fd, 0, root_dir, false, entry, name_max, db,
-            select_stmt, insert_stmt, delete_stmt, temp_insert_stmt,
-            temp_truncate_stmt);
+   err = go("", 1, root_fd, 0, root_dir, entry, name_max, db, select_stmt,
+            insert_stmt, delete_stmt, temp_insert_stmt, temp_truncate_stmt);
    if (err)
       return err;
 
@@ -171,8 +169,7 @@ int main(int argc, char **argv) {
 
 static int go(
    const char *dirpath, const size_t dirpath_size, const int dirfd,
-   const ino_t dir_inode, DIR *dir, bool dir_was_new, struct dirent *entry,
-   long name_max,
+   const ino_t dir_inode, DIR *dir, struct dirent *entry, long name_max,
    sqlite3 *db,
    sqlite3_stmt *select_stmt,
    sqlite3_stmt *insert_stmt,
@@ -318,7 +315,7 @@ static int go(
       if (!(err == SQLITE_ROW || err == SQLITE_DONE))
          return fail_sql("stepping SELECT", sqlite3_errstr(err));
 
-      bool entry_is_new = true;
+      bool entry_is_new;
       if (err == SQLITE_ROW) {
 #define CHECK_NOMEM(x) do { \
    if ((x) == 0 && sqlite3_errcode(db) == SQLITE_NOMEM) \
@@ -346,16 +343,17 @@ static int go(
          const int64_t rdev = sqlite3_column_int64(select_stmt, 9);
          CHECK_NOMEM(rdev);
 
-         entry_is_new = !dir_was_new && (
+         entry_is_new =
             st.st_ino != inode ||
             // We don't care about permission changes.
             (st.st_mode & S_IFMT) != (mode & S_IFMT) ||
             st.st_size != size ||
             st.st_mtime != mtime ||
             (S_ISLNK(st.st_mode) && strcmp(entry_link_target, link_target)) ||
-            ((S_ISBLK(st.st_mode) | S_ISCHR(st.st_mode)) && st.st_rdev != rdev)
-         );
-      }
+            ((S_ISBLK(st.st_mode) | S_ISCHR(st.st_mode))
+                && st.st_rdev != rdev);
+      } else
+         entry_is_new = true;
       sqlite3_reset(select_stmt);
 
       if (entry_is_new) {
@@ -418,9 +416,9 @@ static int go(
          return 1;
       }
 
-      err = go(entry_path, entry_path_size, fd, st.st_ino, entry_dir,
-               entry_is_new, entry, name_max, db, select_stmt, insert_stmt,
-               delete_stmt, temp_insert_stmt, temp_truncate_stmt);
+      err = go(entry_path, entry_path_size, fd, st.st_ino, entry_dir, entry,
+               name_max, db, select_stmt, insert_stmt, delete_stmt,
+               temp_insert_stmt, temp_truncate_stmt);
       if (err)
          return err;
       free(entry_path);
