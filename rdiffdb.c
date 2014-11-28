@@ -426,8 +426,7 @@ static int go(
 
       DIR *entry_dir = fdopendir(fd);
       if (!entry_dir) {
-         fprintf(stderr, "fdopendir('%s'): %s\n", entry_path,
-                 strerror(errno));
+         fprintf(stderr, "fdopendir('%s'): %s\n", entry_path, strerror(errno));
          return 1;
       }
 
