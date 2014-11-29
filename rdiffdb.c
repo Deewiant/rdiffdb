@@ -29,6 +29,29 @@ struct db_val {
    char link_target[];
 };
 
+// Stores a string either inline or not.
+struct len_str {
+   size_t len;
+   const char *p;
+   char str[];
+};
+
+static guint len_str_hash(gconstpointer p) {
+   const struct len_str *ls = p;
+   const char *s = ls->p ? ls->p : ls->str;
+   // Larson's.
+   guint h = 0;
+   for (size_t i = 0, e = ls->len; i < e; ++i)
+      h = 101*h + s[i];
+   return h;
+}
+static gboolean len_str_equal(gconstpointer p1, gconstpointer p2) {
+   const struct len_str *ls1 = p1, *ls2 = p2;
+   return ls1->len == ls2->len &&
+      !memcmp(ls1->p ? ls1->p : ls1->str, ls2->p ? ls2->p : ls2->str,
+              ls1->len);
+}
+
 static int fail_act(const char *action, const char *errmsg) {
    fprintf(stderr, "Error %s: %s\n", action, errmsg);
    return 4;
@@ -132,7 +155,7 @@ static int go(
    leveldb_writebatch_t *batch = leveldb_writebatch_create();
 
    GHashTable *names =
-      g_hash_table_new_full(g_str_hash, g_str_equal, free, NULL);
+      g_hash_table_new_full(len_str_hash, len_str_equal, free, NULL);
 
    int s;
 
@@ -160,12 +183,14 @@ static int go(
          entry_name_len = (int)len;
       }
 
-      char *dup = strdup(entry->d_name);
-      if (!dup) {
-         perror("strdup");
+      struct len_str *ls = calloc(1, entry_name_len + sizeof *ls);
+      if (!ls) {
+         perror("calloc");
          return 4;
       }
-      g_hash_table_add(names, dup);
+      ls->len = entry_name_len;
+      memcpy(ls->str, entry->d_name, ls->len);
+      g_hash_table_add(names, ls);
 
       struct stat st;
       int fd = -1;
@@ -448,22 +473,9 @@ static int go(
       if (memcmp(k, &dir_inode, sizeof dir_inode))
          break;
 
-      // g_hash_table_contains needs a null-terminated string...
-      const size_t namesz = keylen - sizeof dir_inode + 1;
-      if (namesz > *keycap) {
-         *keycap = namesz;
-         char *p = realloc(*key, *keycap);
-         if (!p) {
-            perror("realloc");
-            return 4;
-         }
-         *key = p;
-      }
-      char *name = *key;
-      memcpy(name, k + sizeof dir_inode, namesz - 1);
-      name[namesz - 1] = '\0';
-
-      if (!g_hash_table_contains(names, name)) {
+      const struct len_str ls =
+         { keylen - sizeof dir_inode, .p = k + sizeof dir_inode };
+      if (!g_hash_table_contains(names, &ls)) {
          size_t vallen;
          const char *valbuf = leveldb_iter_value(iter, &vallen);
          const struct db_val *val = (struct db_val*)valbuf;
