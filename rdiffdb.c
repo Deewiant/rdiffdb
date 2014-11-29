@@ -37,10 +37,11 @@ static leveldb_readoptions_t *ropts;
 static leveldb_writeoptions_t *wopts;
 
 static int go(
-   char *dirpath, const size_t dirpath_len, size_t dirpath_cap,
-   const int dirfd, const ino_t dir_inode, DIR *dir, struct dirent *entry,
-   long name_max, char *entry_link_target, size_t entry_link_target_cap,
-   dev_t *seen_devs, size_t seen_devs_count, size_t seen_devs_cap,
+   char **dirpath, const size_t dirpath_len, size_t *dirpath_cap,
+   const int dirfd, const ino_t dir_inode, DIR *dir, struct dirent **entry,
+   long *name_max, char **entry_link_target, size_t *entry_link_target_cap,
+   dev_t **seen_devs, size_t *seen_devs_count, size_t *seen_devs_cap,
+   char **key, size_t *keycap, struct db_val **newval, size_t *newvalcap,
    leveldb_t *db);
 
 static int rmr(ino_t dir_inode, leveldb_t *db, leveldb_writebatch_t *batch);
@@ -86,12 +87,14 @@ int main(int argc, char **argv) {
       malloc(offsetof(struct dirent, d_name) + name_max + 1);
 
    const long path_max = fpathconf(root_fd, _PC_PATH_MAX);
-   const size_t dirpath_cap = path_max == -1 ? PATH_MAX : path_max;
-   const size_t link_target_buf_cap = dirpath_cap;
+   size_t dirpath_cap = path_max == -1 ? PATH_MAX : path_max;
+   size_t link_target_buf_cap = dirpath_cap;
+   size_t valcap = link_target_buf_cap + sizeof (struct db_val);
    char *dirpath = malloc(dirpath_cap);
    char *link_target_buf = malloc(link_target_buf_cap);
+   struct db_val *val = calloc(1, valcap);
 
-   if (!entry || !dirpath || !link_target_buf) {
+   if (!entry || !dirpath || !link_target_buf || !val) {
       perror("malloc");
       return 4;
    }
@@ -101,15 +104,24 @@ int main(int argc, char **argv) {
    ropts = leveldb_readoptions_create();
    wopts = leveldb_writeoptions_create();
 
-   return go(dirpath, 0, dirpath_cap, root_fd, 0, root_dir, entry, name_max,
-             link_target_buf, link_target_buf_cap, NULL, 0, 0, db);
+   dev_t *seen_devs = NULL;
+   size_t seen_devs_count = 0;
+   size_t seen_devs_cap = 0;
+   char *key = NULL;
+   size_t keycap = 0;
+
+   return go(&dirpath, 0, &dirpath_cap, root_fd, 0, root_dir, &entry,
+             &name_max, &link_target_buf, &link_target_buf_cap, &seen_devs,
+             &seen_devs_count, &seen_devs_cap, &key, &keycap, &val, &valcap,
+             db);
 }
 
 static int go(
-   char *dirpath, const size_t dirpath_len, size_t dirpath_cap,
-   const int dirfd, const ino_t dir_inode, DIR *dir, struct dirent *entry,
-   long name_max, char *entry_link_target, size_t entry_link_target_cap,
-   dev_t *seen_devs, size_t seen_devs_count, size_t seen_devs_cap,
+   char **dirpath, const size_t dirpath_len, size_t *dirpath_cap,
+   const int dirfd, const ino_t dir_inode, DIR *dir, struct dirent **pentry,
+   long *name_max, char **entry_link_target, size_t *entry_link_target_cap,
+   dev_t **pseen_devs, size_t *seen_devs_count, size_t *seen_devs_cap,
+   char **key, size_t *keycap, struct db_val **newval, size_t *newvalcap,
    leveldb_t *db)
 {
    leveldb_writebatch_t *batch = leveldb_writebatch_create();
@@ -120,13 +132,13 @@ static int go(
    int s;
 
    for (;;) {
-      struct dirent *p;
-      if (readdir_r(dir, entry, &p)) {
+      struct dirent *entry;
+      if (readdir_r(dir, *pentry, &entry)) {
          fprintf(stderr, "readdir_r('%s'): %s\n",
-                 dirpath, strerror(errno));
+                 *dirpath, strerror(errno));
          return 1;
       }
-      if (!p)
+      if (!entry)
          break;
 
       if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
@@ -137,7 +149,7 @@ static int go(
          const size_t len = strlen(entry->d_name);
          if (len > (size_t)INT_MAX) {
             fprintf(stderr, "Name of inode %ju in '%s' too long %zd\n",
-                    (uintmax_t)entry->d_ino, dirpath, len);
+                    (uintmax_t)entry->d_ino, *dirpath, len);
             return 1;
          }
          entry_name_len = (int)len;
@@ -168,7 +180,7 @@ static int go(
             // Note: a possible reason is EPERM due to O_NOATIME, since it
             // requires write permissions.
             fprintf(stderr, "openat('%s', '%s', %#x): %s\n",
-                    dirpath, entry->d_name, oflags, strerror(errno));
+                    *dirpath, entry->d_name, oflags, strerror(errno));
             return 1;
          }
       }
@@ -183,34 +195,34 @@ static int go(
          {
             fprintf(stderr, fd == -1 ? "fstatat('%s', '%s'): %s\n"
                                      : "fstat('%s'/'%s'): %s\n",
-                    dirpath, entry->d_name, strerror(errno));
+                    *dirpath, entry->d_name, strerror(errno));
             return 1;
          }
 
          if (!S_ISLNK(st.st_mode))
             break;
 
-         if (st.st_size >= entry_link_target_cap) {
-            entry_link_target_cap *= 2;
-            entry_link_target =
-               realloc(entry_link_target, entry_link_target_cap);
-            if (!entry_link_target) {
+         if (st.st_size >= *entry_link_target_cap) {
+            *entry_link_target_cap *= 2;
+            char *p = realloc(*entry_link_target, *entry_link_target_cap);
+            if (!p) {
                perror("realloc");
                return 4;
             }
+            *entry_link_target = p;
          }
 
          const ssize_t len =
-            readlinkat(dirfd, entry->d_name, entry_link_target,
-                       entry_link_target_cap);
+            readlinkat(dirfd, entry->d_name, *entry_link_target,
+                       *entry_link_target_cap);
          if (len == -1) {
             fprintf(stderr, "readlinkat('%s', '%s'): %s\n",
-                    dirpath, entry->d_name, strerror(errno));
+                    *dirpath, entry->d_name, strerror(errno));
             return 1;
          }
          if (len > (ssize_t)INT_MAX) {
             fprintf(stderr, "readlinkat('%s', '%s'): too long %zd\n",
-                    dirpath, entry->d_name, len);
+                    *dirpath, entry->d_name, len);
             return 1;
          }
          if (len != st.st_size) {
@@ -219,26 +231,27 @@ static int go(
             continue;
          }
          entry_link_len = (int)len;
-         entry_link_target[entry_link_len] = '\0';
+         (*entry_link_target)[entry_link_len] = '\0';
          break;
       }
 
       char *entry_path = NULL;
       size_t entry_path_len;
       if (S_ISDIR(st.st_mode)) {
-         // Reäppropriate dirpath as a buffer for this entry's path.
+         // Reäppropriate *dirpath as a buffer for this entry's path.
          const bool need_slash = dirpath_len != 0;
          const size_t dir_slashed_len = dirpath_len + (need_slash ? 1 : 0);
          entry_path_len = dir_slashed_len + entry_name_len;
-         if (entry_path_len >= dirpath_cap) {
-            dirpath_cap = entry_path_len + 1 + name_max;
-            dirpath = realloc(dirpath, dirpath_cap);
-            if (!dirpath) {
+         if (entry_path_len >= *dirpath_cap) {
+            *dirpath_cap = entry_path_len + 1 + *name_max;
+            char *p = realloc(*dirpath, *dirpath_cap);
+            if (!p) {
                perror("realloc");
                return 4;
             }
+            *dirpath = p;
          }
-         entry_path = dirpath;
+         entry_path = *dirpath;
          if (need_slash)
             entry_path[dirpath_len] = '/';
          memcpy(entry_path + dir_slashed_len, entry->d_name, entry_name_len);
@@ -255,17 +268,21 @@ static int go(
       }
 
       const size_t keylen = entry_name_len + sizeof dir_inode;
-      char *key = malloc(keylen);
-      if (!key) {
-         perror("malloc");
-         return 4;
+      if (keylen > *keycap) {
+         *keycap = keylen;
+         char *k = realloc(*key, *keycap);
+         if (!k) {
+            perror("realloc");
+            return 4;
+         }
+         *key = k;
       }
-      memcpy(key, &dir_inode, sizeof dir_inode);
-      memcpy(key + sizeof dir_inode, entry->d_name, entry_name_len);
+      memcpy(*key, &dir_inode, sizeof dir_inode);
+      memcpy(*key + sizeof dir_inode, entry->d_name, entry_name_len);
 
       char *err = NULL;
       size_t vallen;
-      char *valbuf = leveldb_get(db, ropts, key, keylen, &vallen, &err);
+      char *valbuf = leveldb_get(db, ropts, *key, keylen, &vallen, &err);
       if (err)
          return fail_act("getting", err);
 
@@ -280,7 +297,7 @@ static int go(
          memcmp(&st.st_mtim, &val->mtime, sizeof st.st_mtim) ||
          (S_ISLNK(st.st_mode) &&
              (entry_link_len != val->link_target_len ||
-              memcmp(entry_link_target, val->link_target, entry_link_len))) ||
+              memcmp(*entry_link_target, val->link_target, entry_link_len))) ||
          ((S_ISBLK(st.st_mode) | S_ISCHR(st.st_mode))
              && st.st_rdev != val->rdev);
 
@@ -288,8 +305,8 @@ static int go(
          if (entry_path)
             puts(entry_path);
          else {
-            if (*dirpath) {
-               fputs(dirpath, stdout);
+            if (**dirpath) {
+               fputs(*dirpath, stdout);
                putchar('/');
             }
             puts(entry->d_name);
@@ -298,11 +315,16 @@ static int go(
 
       if (!val) {
          vallen = entry_link_len + sizeof *val;
-         val = calloc(1, vallen);
-         if (!val) {
-            perror("calloc");
-            return 4;
+         if (vallen > *newvalcap) {
+            *newvalcap = vallen;
+            struct db_val *p = realloc(*newval, *newvalcap);
+            if (!p) {
+               perror("realloc");
+               return 4;
+            }
+            *newval = p;
          }
+         val = *newval;
       }
 
       val->inode = st.st_ino;
@@ -315,14 +337,11 @@ static int go(
       val->mode = st.st_mode;
       val->uid = st.st_uid;
       val->gid = st.st_gid;
-      memcpy(val->link_target, entry_link_target, entry_link_len);
+      memcpy(val->link_target, *entry_link_target, entry_link_len);
 
-      leveldb_writebatch_put(batch, key, keylen, (const char*)val, vallen);
-      free(key);
+      leveldb_writebatch_put(batch, *key, keylen, (const char*)val, vallen);
       if (valbuf)
          leveldb_free(valbuf);
-      else
-         free(val);
 
       if (!S_ISDIR(st.st_mode))
          continue;
@@ -333,8 +352,9 @@ static int go(
          return 1;
       }
 
+      dev_t *seen_devs = *pseen_devs;
       bool seen_dev = false;
-      for (size_t i = 0; i < seen_devs_count; ++i) {
+      for (size_t i = 0, e = *seen_devs_count; i < e; ++i) {
          if (seen_devs[i] == st.st_dev) {
             seen_dev = true;
             break;
@@ -342,35 +362,38 @@ static int go(
       }
 
       if (!seen_dev) {
-         if (seen_devs_count == seen_devs_cap) {
-            seen_devs_cap += 16;
-            seen_devs = realloc(seen_devs, seen_devs_cap * sizeof *seen_devs);
+         if (*seen_devs_count == *seen_devs_cap) {
+            *seen_devs_cap += 16;
+            seen_devs = realloc(seen_devs, *seen_devs_cap * sizeof *seen_devs);
             if (!seen_devs) {
                perror("realloc");
                return 4;
             }
+            *pseen_devs = seen_devs;
          }
-         seen_devs[seen_devs_count++] = st.st_dev;
+         seen_devs[*seen_devs_count++] = st.st_dev;
 
          const long new_name_max = fpathconf(fd, _PC_NAME_MAX);
-         if (new_name_max > name_max) {
-            name_max = new_name_max;
+         if (new_name_max > *name_max) {
+            *name_max = new_name_max;
             entry =
-               realloc(entry, offsetof(struct dirent, d_name) + name_max + 1);
+               realloc(entry, offsetof(struct dirent, d_name) + *name_max + 1);
             if (!entry) {
                perror("realloc");
                return 4;
             }
+            *pentry = entry;
          }
       }
 
-      s = go(entry_path, entry_path_len, dirpath_cap, fd, st.st_ino, entry_dir,
-             entry, name_max, entry_link_target, entry_link_target_cap,
-             seen_devs, seen_devs_count, seen_devs_cap, db);
+      s = go(dirpath, entry_path_len, dirpath_cap, fd, st.st_ino, entry_dir,
+             pentry, name_max, entry_link_target, entry_link_target_cap,
+             pseen_devs, seen_devs_count, seen_devs_cap, key, keycap, newval,
+             newvalcap, db);
       if (s)
          return s;
       closedir(entry_dir);
-      entry_path[dirpath_len] = '\0';
+      (*dirpath)[dirpath_len] = '\0';
    }
 
    // Delete any preëxisting entries in the DB that have disappeared from the
@@ -388,8 +411,8 @@ static int go(
 
    while (leveldb_iter_valid(iter)) {
       size_t keylen;
-      const char *key = leveldb_iter_key(iter, &keylen);
-      if (memcmp(key, &dir_inode, sizeof dir_inode))
+      const char *k = leveldb_iter_key(iter, &keylen);
+      if (memcmp(k, &dir_inode, sizeof dir_inode))
          break;
 
       size_t vallen;
@@ -405,7 +428,7 @@ static int go(
       }
 
       if (!found) {
-         leveldb_writebatch_delete(batch, key, keylen);
+         leveldb_writebatch_delete(batch, k, keylen);
          if (S_ISDIR(val->mode) && (s = rmr(val->inode, db, batch)))
             return s;
       }
