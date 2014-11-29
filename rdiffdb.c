@@ -14,27 +14,36 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <sqlite3.h>
+#include <leveldb/c.h>
 
-#define ANALYZE_FREQUENCY_FACTOR 4
+struct db_val {
+   ino_t inode;
+   off_t size;
+   struct timespec mtime, atime, ctime;
+   dev_t rdev;
+   long link_target_len;
+   mode_t mode;
+   uid_t uid;
+   gid_t gid;
+   char link_target[];
+};
 
-static int fail_sql(const char *action, const char *errmsg) {
+static int fail_act(const char *action, const char *errmsg) {
    fprintf(stderr, "Error %s: %s\n", action, errmsg);
    return 4;
 }
+
+static leveldb_readoptions_t *ropts;
+static leveldb_writeoptions_t *wopts;
 
 static int go(
    char *dirpath, const size_t dirpath_len, size_t dirpath_cap,
    const int dirfd, const ino_t dir_inode, DIR *dir, struct dirent *entry,
    long name_max, char *entry_link_target, size_t entry_link_target_cap,
    dev_t *seen_devs, size_t seen_devs_count, size_t seen_devs_cap,
-   unsigned insertions, unsigned next_analysis,
-   sqlite3 *db,
-   sqlite3_stmt *select_stmt,
-   sqlite3_stmt *insert_stmt,
-   sqlite3_stmt *delete_stmt,
-   sqlite3_stmt *temp_insert_stmt,
-   sqlite3_stmt *temp_truncate_stmt);
+   leveldb_t *db);
+
+static int rmr(ino_t dir_inode, leveldb_t *db, leveldb_writebatch_t *batch);
 
 int main(int argc, char **argv) {
    if (argc != 2) {
@@ -45,101 +54,19 @@ int main(int argc, char **argv) {
 
    const char *db_path = argv[1];
 
-   sqlite3 *diskdb;
-   int err = sqlite3_open(db_path, &diskdb);
+   leveldb_options_t *opts = leveldb_options_create();
+   leveldb_options_set_filter_policy(
+      opts, leveldb_filterpolicy_create_bloom(10));
+   leveldb_options_set_create_if_missing(opts, 1);
+
+   char *err = NULL;
+   leveldb_t *db = leveldb_open(opts, db_path, &err);
    if (err) {
-      fprintf(stderr, "Error opening DB at '%s': %s\n",
-              db_path, sqlite3_errstr(err));
+      fprintf(stderr, "Error opening DB at '%s': %s\n", db_path, err);
       return 3;
    }
 
-   sqlite3 *db;
-   err = sqlite3_open(":memory:", &db);
-   if (err)
-      return fail_sql("creating in-memory DB", sqlite3_errstr(err));
-
-   sqlite3_backup *bak = sqlite3_backup_init(db, "main", diskdb, "main");
-   if (!bak)
-      return fail_sql("initing DB load", sqlite3_errmsg(db));
-
-   err = sqlite3_backup_step(bak, -1);
-   if (err != SQLITE_DONE)
-      return fail_sql("loading DB to memory", sqlite3_errmsg(db));
-
-   sqlite3_backup_finish(bak);
-
-   char *errmsg;
-   sqlite3_exec(db, "PRAGMA encoding = \"UTF-8\"", NULL, NULL, &errmsg);
-   if (errmsg) return fail_sql("setting pragma", errmsg);
-
-   sqlite3_exec(
-      db,
-      "CREATE TABLE IF NOT EXISTS paths ("
-      "inode INTEGER UNIQUE NOT NULL,"
-      // Theoretically this should have a foreign key constraint to the above,
-      // but doing this allows doing recursive deletes bottom-up instead of
-      // top-down.
-      "parent_inode INTEGER,"
-      "name TEXT NOT NULL,"
-      "mode INTEGER NOT NULL,"
-      "uid INTEGER NOT NULL,"
-      "gid INTEGER NOT NULL,"
-      "size INTEGER NOT NULL,"
-      "mtime DATETIME NOT NULL,"
-      "atime DATETIME NOT NULL,"
-      "ctime DATETIME NOT NULL,"
-      "link_target TEXT,"
-      "rdev INTEGER,"
-      "PRIMARY KEY (parent_inode, name))",
-      NULL, NULL, &errmsg);
-   if (errmsg) return fail_sql("creating table", errmsg);
-
-   // We can't bind an inline set like we would want in "WHERE x NOT IN ?", so
-   // instead we use a temporary table.
-   sqlite3_exec(
-      db, "CREATE TEMPORARY TABLE temp.inodes (inode INTEGER PRIMARY KEY)",
-      NULL, NULL, &errmsg);
-   if (errmsg) return fail_sql("creating temporary table", errmsg);
-
-   sqlite3_stmt *select_stmt;
-   err = sqlite3_prepare_v2(
-      db,
-      "SELECT inode, mode, uid, gid, size, mtime, atime, ctime, link_target, "
-         "rdev "
-      "FROM paths WHERE parent_inode IS ?1 AND name = ?2",
-      -1, &select_stmt, NULL);
-   if (err)
-      return fail_sql("preparing SELECT", sqlite3_errstr(err));
-
-   sqlite3_stmt *insert_stmt;
-   err = sqlite3_prepare_v2(
-      db, "INSERT OR REPLACE INTO paths VALUES "
-          "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      -1, &insert_stmt, NULL);
-   if (err)
-      return fail_sql("preparing INSERT", sqlite3_errstr(err));
-
-   sqlite3_stmt *delete_stmt;
-   err = sqlite3_prepare_v2(
-      db,
-      "DELETE FROM paths "
-      "WHERE parent_inode IS ? AND "
-         "NOT EXISTS (SELECT 1 FROM temp.inodes WHERE inode = paths.inode)",
-      -1, &delete_stmt, NULL);
-   if (err)
-      return fail_sql("preparing DELETE", sqlite3_errstr(err));
-
-   sqlite3_stmt *temp_insert_stmt;
-   err = sqlite3_prepare_v2(
-      db, "INSERT INTO temp.inodes VALUES (?)", -1, &temp_insert_stmt, NULL);
-   if (err)
-      return fail_sql("preparing temp INSERT", sqlite3_errstr(err));
-
-   sqlite3_stmt *temp_truncate_stmt;
-   err = sqlite3_prepare_v2(
-      db, "DELETE FROM temp.inodes", -1, &temp_truncate_stmt, NULL);
-   if (err)
-      return fail_sql("preparing temp truncate", sqlite3_errstr(err));
+   leveldb_options_destroy(opts);
 
    const int root_fd = open(".", O_DIRECTORY | O_NOATIME | O_RDONLY);
    if (root_fd == -1) {
@@ -171,34 +98,11 @@ int main(int argc, char **argv) {
 
    strcpy(dirpath, "");
 
-   sqlite3_exec(db, "BEGIN IMMEDIATE TRANSACTION", NULL, NULL, &errmsg);
-   if (errmsg) return fail_sql("beginning transaction", errmsg);
+   ropts = leveldb_readoptions_create();
+   wopts = leveldb_writeoptions_create();
 
-   err = go(dirpath, 0, dirpath_cap, root_fd, 0, root_dir, entry, name_max,
-            link_target_buf, link_target_buf_cap, NULL, 0, 0, 0,
-            ANALYZE_FREQUENCY_FACTOR, db, select_stmt, insert_stmt,
-            delete_stmt, temp_insert_stmt, temp_truncate_stmt);
-   if (err)
-      return err;
-
-   // Complete any unfinished recursive deletions.
-   do {
-      sqlite3_exec(db, "DELETE FROM paths "
-                       "WHERE parent_inode NOT IN (SELECT inode FROM paths)",
-                   NULL, NULL, &errmsg);
-      if (errmsg) return fail_sql("deleting recursively", errmsg);
-   } while (sqlite3_changes(db));
-
-   sqlite3_exec(db, "COMMIT", NULL, NULL, &errmsg);
-   if (errmsg) return fail_sql("committing", errmsg);
-
-   bak = sqlite3_backup_init(diskdb, "main", db, "main");
-   if (!bak)
-      return fail_sql("initing DB save", sqlite3_errmsg(db));
-
-   err = sqlite3_backup_step(bak, -1);
-   if (err != SQLITE_DONE)
-      return fail_sql("saving DB to disk", sqlite4_errmsg(db));
+   return go(dirpath, 0, dirpath_cap, root_fd, 0, root_dir, entry, name_max,
+             link_target_buf, link_target_buf_cap, NULL, 0, 0, db);
 }
 
 static int go(
@@ -206,14 +110,10 @@ static int go(
    const int dirfd, const ino_t dir_inode, DIR *dir, struct dirent *entry,
    long name_max, char *entry_link_target, size_t entry_link_target_cap,
    dev_t *seen_devs, size_t seen_devs_count, size_t seen_devs_cap,
-   unsigned insertions, unsigned next_analysis,
-   sqlite3 *db,
-   sqlite3_stmt *select_stmt,
-   sqlite3_stmt *insert_stmt,
-   sqlite3_stmt *delete_stmt,
-   sqlite3_stmt *temp_insert_stmt,
-   sqlite3_stmt *temp_truncate_stmt)
+   leveldb_t *db)
 {
+   leveldb_writebatch_t *batch = leveldb_writebatch_create();
+
    ino_t *inodes = NULL;
    size_t inodes_len = 0, inodes_cap = 0;
 
@@ -273,7 +173,7 @@ static int go(
 
       // This may be somewhat overkill since we don't even handle files
       // disappearing out from under us, but oh well.
-      int entry_link_len;
+      int entry_link_len = 0;
       for (;;) {
          if ((fd == -1
                  ? fstatat(dirfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW)
@@ -346,65 +246,43 @@ static int go(
             entry_path[dirpath_len] = '/';
          memcpy(entry_path + dir_slashed_len, entry->d_name, entry_name_len);
          entry_path[dir_slashed_len + entry_name_len] = '\0';
+
+         if (st.st_ino == 0) {
+            fprintf(stderr, "Directory '%s' has unsupported inode value 0\n",
+                    entry_path);
+            return 1;
+         }
       }
 
-#define CHECK_BIND(x) do { \
-   if (err) \
-         return fail_sql("binding to " x, sqlite3_errstr(err)); \
-} while (0)
-      int err;
-      err = dirpath_len
-         ? sqlite3_bind_int64(select_stmt, 1, dir_inode)
-         : sqlite3_bind_null(select_stmt, 1);
-      CHECK_BIND("SELECT");
-      err = sqlite3_bind_text(select_stmt, 2, entry->d_name, entry_name_len,
-                              SQLITE_STATIC);
-      CHECK_BIND("SELECT");
+      size_t keylen = entry_name_len + sizeof dir_inode;
+      char *key = malloc(keylen);
+      if (!key) {
+         perror("malloc");
+         return 4;
+      }
+      memcpy(key, &dir_inode, sizeof dir_inode);
+      memcpy(key + sizeof dir_inode, entry->d_name, entry_name_len);
 
-      err = sqlite3_step(select_stmt);
-      if (!(err == SQLITE_ROW || err == SQLITE_DONE))
-         return fail_sql("stepping SELECT", sqlite3_errstr(err));
+      char *err = NULL;
+      size_t vallen;
+      char *valbuf = leveldb_get(db, ropts, key, keylen, &vallen, &err);
+      if (err)
+         return fail_act("getting", err);
 
-      bool entry_is_new;
-      if (err == SQLITE_ROW) {
-#define CHECK_NOMEM(x) do { \
-   if ((x) == 0 && sqlite3_errcode(db) == SQLITE_NOMEM) \
-      return fail_sql("fetching column", sqlite3_errstr(err)); \
-} while (0)
-         const int64_t inode = sqlite3_column_int64(select_stmt, 0);
-         CHECK_NOMEM(inode);
-         const int mode = sqlite3_column_int(select_stmt, 1);
-         CHECK_NOMEM(mode);
-         const int uid = sqlite3_column_int(select_stmt, 2);
-         CHECK_NOMEM(uid);
-         const int gid = sqlite3_column_int(select_stmt, 3);
-         CHECK_NOMEM(gid);
-         const int64_t size = sqlite3_column_int64(select_stmt, 4);
-         CHECK_NOMEM(size);
-         const int64_t mtime = sqlite3_column_int64(select_stmt, 5);
-         CHECK_NOMEM(mtime);
-         const int64_t atime = sqlite3_column_int64(select_stmt, 6);
-         CHECK_NOMEM(atime);
-         const int64_t ctime = sqlite3_column_int64(select_stmt, 7);
-         CHECK_NOMEM(ctime);
-         const char *const link_target = (const char *)
-            sqlite3_column_text(select_stmt, 8);
-         CHECK_NOMEM(link_target);
-         const int64_t rdev = sqlite3_column_int64(select_stmt, 9);
-         CHECK_NOMEM(rdev);
+      struct db_val *val = (struct db_val*)valbuf;
 
-         entry_is_new =
-            st.st_ino != inode ||
-            // We don't care about permission changes.
-            (st.st_mode & S_IFMT) != (mode & S_IFMT) ||
-            st.st_size != size ||
-            st.st_mtime != mtime ||
-            (S_ISLNK(st.st_mode) && strcmp(entry_link_target, link_target)) ||
-            ((S_ISBLK(st.st_mode) | S_ISCHR(st.st_mode))
-                && st.st_rdev != rdev);
-      } else
-         entry_is_new = true;
-      sqlite3_reset(select_stmt);
+      const bool entry_is_new =
+         !val ||
+         st.st_ino != val->inode ||
+         // We don't care about permission changes.
+         (st.st_mode & S_IFMT) != (val->mode & S_IFMT) ||
+         st.st_size != val->size ||
+         memcmp(&st.st_mtim, &val->mtime, sizeof st.st_mtim) ||
+         (S_ISLNK(st.st_mode) &&
+             (entry_link_len != val->link_target_len ||
+              memcmp(entry_link_target, val->link_target, entry_link_len))) ||
+         ((S_ISBLK(st.st_mode) | S_ISCHR(st.st_mode))
+             && st.st_rdev != val->rdev);
 
       if (entry_is_new) {
          if (entry_path)
@@ -418,50 +296,33 @@ static int go(
          }
       }
 
-      err = sqlite3_bind_int64(insert_stmt, 1, st.st_ino);
-      CHECK_BIND("INSERT");
-      err = dirpath_len
-         ? sqlite3_bind_int64(insert_stmt, 2, dir_inode)
-         : sqlite3_bind_null(insert_stmt, 2);
-      CHECK_BIND("INSERT");
-      err = sqlite3_bind_text(insert_stmt, 3, entry->d_name,
-                              entry_name_len, SQLITE_STATIC);
-      CHECK_BIND("INSERT");
-      err = sqlite3_bind_int(insert_stmt, 4, st.st_mode);
-      CHECK_BIND("INSERT");
-      err = sqlite3_bind_int(insert_stmt, 5, st.st_uid);
-      CHECK_BIND("INSERT");
-      err = sqlite3_bind_int(insert_stmt, 6, st.st_gid);
-      CHECK_BIND("INSERT");
-      err = sqlite3_bind_int64(insert_stmt, 7, st.st_size);
-      CHECK_BIND("INSERT");
-      err = sqlite3_bind_int64(insert_stmt, 8, st.st_mtime);
-      CHECK_BIND("INSERT");
-      err = sqlite3_bind_int64(insert_stmt, 9, st.st_atime);
-      CHECK_BIND("INSERT");
-      err = sqlite3_bind_int64(insert_stmt, 10, st.st_ctime);
-      CHECK_BIND("INSERT");
-      err = S_ISLNK(st.st_mode)
-               ? sqlite3_bind_text(insert_stmt, 11, entry_link_target,
-                                   entry_link_len, SQLITE_STATIC)
-               : sqlite3_bind_null(insert_stmt, 11);
-      CHECK_BIND("INSERT");
-      err = S_ISBLK(st.st_mode) || S_ISCHR(st.st_mode)
-               ? sqlite3_bind_int64(insert_stmt, 12, st.st_rdev)
-               : sqlite3_bind_null (insert_stmt, 12);
-      CHECK_BIND("INSERT");
-
-      err = sqlite3_step(insert_stmt);
-      if (err != SQLITE_DONE)
-         return fail_sql("stepping INSERT", sqlite3_errstr(err));
-      sqlite3_reset(insert_stmt);
-
-      if (++insertions == next_analysis) {
-         next_analysis *= ANALYZE_FREQUENCY_FACTOR;
-         char *errmsg;
-         sqlite3_exec(db, "ANALYZE paths", NULL, NULL, &errmsg);
-         if (errmsg) return fail_sql("analyzing", errmsg);
+      if (!val) {
+         vallen = entry_link_len + sizeof *val;
+         val = calloc(1, vallen);
+         if (!val) {
+            perror("calloc");
+            return 4;
+         }
       }
+
+      val->inode = st.st_ino;
+      val->size = st.st_size;
+      val->mtime = st.st_mtim;
+      val->atime = st.st_atim;
+      val->ctime = st.st_ctim;
+      val->rdev = st.st_rdev;
+      val->link_target_len = entry_link_len;
+      val->mode = st.st_mode;
+      val->uid = st.st_uid;
+      val->gid = st.st_gid;
+      memcpy(val->link_target, entry_link_target, entry_link_len);
+
+      leveldb_writebatch_put(batch, key, keylen, (const char*)val, vallen);
+      free(key);
+      if (valbuf)
+         leveldb_free(valbuf);
+      else
+         free(val);
 
       if (!S_ISDIR(st.st_mode))
          continue;
@@ -503,41 +364,108 @@ static int go(
          }
       }
 
-      err = go(entry_path, entry_path_len, dirpath_cap, fd, st.st_ino,
-               entry_dir, entry, name_max, entry_link_target,
-               entry_link_target_cap, seen_devs, seen_devs_count,
-               seen_devs_cap, insertions, next_analysis, db, select_stmt,
-               insert_stmt, delete_stmt, temp_insert_stmt, temp_truncate_stmt);
-      if (err)
-         return err;
+      int s = go(entry_path, entry_path_len, dirpath_cap, fd, st.st_ino,
+                 entry_dir, entry, name_max, entry_link_target,
+                 entry_link_target_cap, seen_devs, seen_devs_count,
+                 seen_devs_cap, db);
+      if (s)
+         return s;
       closedir(entry_dir);
       entry_path[dirpath_len] = '\0';
    }
 
-   int err;
-   for (size_t i = 0; i < inodes_len; ++i) {
-      err = sqlite3_bind_int64(temp_insert_stmt, 1, inodes[i]);
-      CHECK_BIND("temp INSERT");
-      err = sqlite3_step(temp_insert_stmt);
-      if (err != SQLITE_DONE)
-         return fail_sql("stepping temp INSERT", sqlite3_errstr(err));
-      sqlite3_reset(temp_insert_stmt);
+   // Delete any preëxisting entries in the DB that have disappeared from the
+   // file system, recursively.
+
+   char *err = NULL;
+   leveldb_iterator_t *iter = leveldb_create_iterator(db, ropts);
+   leveldb_iter_get_error(iter, &err);
+   if (err)
+      return fail_act("creating iterator", err);
+   leveldb_iter_seek(iter, (const char*)&dir_inode, sizeof dir_inode);
+   leveldb_iter_get_error(iter, &err);
+   if (err)
+      return fail_act("seeking iterator", err);
+
+   while (leveldb_iter_valid(iter)) {
+      size_t keylen;
+      const char *key = leveldb_iter_key(iter, &keylen);
+      if (memcmp(key, &dir_inode, sizeof dir_inode))
+         break;
+
+      size_t vallen;
+      const char *valbuf = leveldb_iter_value(iter, &vallen);
+
+      struct db_val *val = (struct db_val*)valbuf;
+
+      bool found = false;
+      for (size_t i = 0; i < inodes_len; ++i) {
+         if (inodes[i] == val->inode) {
+            found = true;
+            break;
+         }
+      }
+
+      if (!found) {
+         leveldb_writebatch_delete(batch, key, keylen);
+         if (S_ISDIR(val->mode)) {
+            int s = rmr(val->inode, db, batch);
+            if (s)
+               return s;
+         }
+      }
+
+      leveldb_iter_next(iter);
+      leveldb_iter_get_error(iter, &err);
+      if (err)
+         return fail_act("nexting iterator", err);
    }
    free(inodes);
+   leveldb_iter_destroy(iter);
 
-   err = dirpath_len
-      ? sqlite3_bind_int64(delete_stmt, 1, dir_inode)
-      : sqlite3_bind_null(delete_stmt, 1);
-   CHECK_BIND("DELETE");
-   err = sqlite3_step(delete_stmt);
-   if (err != SQLITE_DONE)
-      return fail_sql("stepping DELETE", sqlite3_errstr(err));
-   sqlite3_reset(delete_stmt);
+   leveldb_write(db, wopts, batch, &err);
+   if (err)
+      return fail_act("writing", err);
+   leveldb_writebatch_destroy(batch);
 
-   err = sqlite3_step(temp_truncate_stmt);
-   if (err != SQLITE_DONE)
-      return fail_sql("stepping temp truncate", sqlite3_errstr(err));
-   sqlite3_reset(temp_truncate_stmt);
+   return 0;
+}
 
+static int rmr(ino_t dir_inode, leveldb_t *db, leveldb_writebatch_t *batch) {
+   char *err = NULL;
+
+   leveldb_iterator_t *iter = leveldb_create_iterator(db, ropts);
+   leveldb_iter_get_error(iter, &err);
+   if (err)
+      return fail_act("creating iterator", err);
+   leveldb_iter_seek(iter, (const char*)&dir_inode, sizeof dir_inode);
+   leveldb_iter_get_error(iter, &err);
+   if (err)
+      return fail_act("seeking iterator", err);
+
+   while (leveldb_iter_valid(iter)) {
+      size_t keylen;
+      const char *key = leveldb_iter_key(iter, &keylen);
+      if (memcmp(key, &dir_inode, sizeof dir_inode))
+         break;
+
+      size_t vallen;
+      const char *valbuf = leveldb_iter_value(iter, &vallen);
+
+      struct db_val *val = (struct db_val*)valbuf;
+
+      leveldb_writebatch_delete(batch, key, keylen);
+      if (S_ISDIR(val->mode)) {
+         int s = rmr(val->inode, db, batch);
+         if (s)
+            return s;
+      }
+
+      leveldb_iter_next(iter);
+      leveldb_iter_get_error(iter, &err);
+      if (err)
+         return fail_act("nexting iterator", err);
+   }
+   leveldb_iter_destroy(iter);
    return 0;
 }
