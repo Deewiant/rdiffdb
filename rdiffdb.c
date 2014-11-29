@@ -315,6 +315,37 @@ static int go(
             }
             puts(entry->d_name);
          }
+
+#if defined(RDIFFDB_DEBUG) && RDIFFDB_DEBUG > 0
+         if (!val)
+            printf("\twas not in DB\n");
+         else {
+            if (st.st_ino != val->inode)
+               printf("\tinodes: FS %ju != DB %ju\n",
+                      (uintmax_t)st.st_ino, (uintmax_t)val->inode);
+            if ((st.st_mode & S_IFMT) != (val->mode & S_IFMT))
+               printf("\ttypes: FS 0o%o != DB 0o%o\n",
+                      (unsigned)(st.st_mode & S_IFMT),
+                      (unsigned)(val->mode & S_IFMT));
+            if (st.st_size != val->size)
+               printf("\tsizes: FS %ju != DB %ju\n",
+                      (uintmax_t)st.st_size, (uintmax_t)val->size);
+            if (memcmp(&st.st_mtim, &val->mtime, sizeof st.st_mtim))
+               printf("\tmtimes: FS %jd.%09lu != DB %jd.%09lu\n",
+                      (intmax_t)st.st_mtim.tv_sec, st.st_mtim.tv_nsec,
+                      (intmax_t)val->mtime.tv_sec, val->mtime.tv_nsec);
+            if (S_ISLNK(st.st_mode) &&
+                (entry_link_len != val->link_target_len ||
+                 memcmp(*entry_link_target, val->link_target, entry_link_len)))
+               printf("\tlink targets: FS '%s' != DB '%.*s'\n",
+                      *entry_link_target, (int)val->link_target_len,
+                      val->link_target);
+            if ((S_ISBLK(st.st_mode) | S_ISCHR(st.st_mode)) &&
+                st.st_rdev != val->rdev)
+               printf("\trdevs: FS %ju != DB %ju\n",
+                      (uintmax_t)st.st_rdev, (uintmax_t)val->rdev);
+         }
+#endif
       }
 
       if (!val) {
@@ -432,6 +463,11 @@ static int go(
       }
 
       if (!found) {
+#if defined(RDIFFDB_DEBUG) && RDIFFDB_DEBUG > 0
+         printf("\tdeleted dir %ju: entry %ju '%.*s'\n",
+                (uintmax_t)dir_inode, (uintmax_t)val->inode,
+                (int)(keylen - sizeof dir_inode), k + sizeof dir_inode);
+#endif
          leveldb_writebatch_delete(batch, k, keylen);
          if (S_ISDIR(val->mode) && (s = rmr(val->inode, db, batch)))
             return s;
@@ -449,6 +485,37 @@ static int go(
    if (err)
       return fail_act("writing", err);
    leveldb_writebatch_destroy(batch);
+
+#if defined(RDIFFDB_DEBUG) && RDIFFDB_DEBUG > 1
+   iter = leveldb_create_iterator(db, ropts);
+   leveldb_iter_get_error(iter, &err);
+   if (err)
+      return fail_act("creating iterator (DEBUG)", err);
+   leveldb_iter_seek(iter, (const char*)&dir_inode, sizeof dir_inode);
+   leveldb_iter_get_error(iter, &err);
+   if (err)
+      return fail_act("seeking iterator (DEBUG)", err);
+   while (leveldb_iter_valid(iter)) {
+      size_t keylen;
+      const char *k = leveldb_iter_key(iter, &keylen);
+      if (memcmp(k, &dir_inode, sizeof dir_inode))
+         break;
+
+      size_t vallen;
+      const char *valbuf = leveldb_iter_value(iter, &vallen);
+      const struct db_val *val = (struct db_val*)valbuf;
+
+      printf("\tremains dir %ju: entry %ju '%.*s'\n",
+             (uintmax_t)dir_inode, (uintmax_t)val->inode,
+             (int)(keylen - sizeof dir_inode), k + sizeof dir_inode);
+
+      leveldb_iter_next(iter);
+      leveldb_iter_get_error(iter, &err);
+      if (err)
+         return fail_act("nexting iterator (DEBUG)", err);
+   }
+   leveldb_iter_destroy(iter);
+#endif
 
    return 0;
 }
