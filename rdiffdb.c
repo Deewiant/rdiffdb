@@ -36,6 +36,18 @@ struct len_str {
    char str[];
 };
 
+enum {
+   OLD = 0,
+   NEW = 1,
+   MOD = 2,
+};
+
+struct seen_name {
+   size_t len;
+   uint8_t new;
+   char name[];
+};
+
 static guint len_str_hash(gconstpointer p) {
    const struct len_str *ls = p;
    const char *s = ls->p ? ls->p : ls->str;
@@ -188,6 +200,9 @@ static int go(
 
    GHashTable *names =
       g_hash_table_new_full(len_str_hash, len_str_equal, free, NULL);
+
+   GHashTable *names_by_inode =
+      g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, free);
 
    int s;
 
@@ -349,19 +364,24 @@ static int go(
          ((S_ISBLK(st.st_mode) | S_ISCHR(st.st_mode))
              && st.st_rdev != val->rdev);
 
+      struct seen_name *sn = malloc(entry_name_len + sizeof *sn);
+      sn->len = entry_name_len;
+      sn->new = !val ? NEW : entry_is_new ? MOD : OLD;
+      memcpy(sn->name, entry->d_name, entry_name_len);
+      g_hash_table_insert(names_by_inode, GINT_TO_POINTER(entry->d_ino), sn);
+
+#if defined(RDIFFDB_DEBUG) && RDIFFDB_DEBUG > 0
       if (entry_is_new) {
-         fputs("A ", stdout);
          if (entry_path)
-            puts(entry_path);
+            fputs(entry_path, stdout);
          else {
             if (**dirpath) {
                fputs(*dirpath, stdout);
                putchar('/');
             }
-            puts(entry->d_name);
+            fputs(entry->d_name, stdout);
          }
-
-#if defined(RDIFFDB_DEBUG) && RDIFFDB_DEBUG > 0
+         puts(" is new because:");
          if (!val)
             printf("\twas not in DB\n");
          else {
@@ -390,8 +410,8 @@ static int go(
                printf("\trdevs: FS %ju != DB %ju\n",
                       (uintmax_t)st.st_rdev, (uintmax_t)val->rdev);
          }
-#endif
       }
+#endif
 
       if (!val) {
          vallen = entry_link_len + sizeof *val;
@@ -498,10 +518,34 @@ static int go(
       const struct len_str ls =
          { keylen - sizeof dir_inode, .p = k + sizeof dir_inode };
 
-      if (!g_hash_table_contains(names, &ls) &&
-          (s = rmr_at_iter(k, keylen, iter, dirpath, dirpath_len, dirpath_cap,
-                           *name_max, db, batch)))
-         return s;
+      if (!g_hash_table_contains(names, &ls)) {
+         size_t vallen;
+         const char *valbuf = leveldb_iter_value(iter, &vallen);
+         const ino_t inode = ((struct db_val*)valbuf)->inode;
+
+         const struct seen_name *sn =
+            g_hash_table_lookup(names_by_inode, GINT_TO_POINTER(inode));
+         if (sn) {
+            fputs("R ", stdout);
+            if (**dirpath) {
+               fputs(*dirpath, stdout);
+               putchar('/');
+            }
+            fwrite(ls.p, 1, ls.len, stdout);
+            fputs(" // ", stdout);
+            if (**dirpath) {
+               fputs(*dirpath, stdout);
+               putchar('/');
+            }
+            fwrite(sn->name, 1, sn->len, stdout);
+            putchar('\n');
+            g_hash_table_remove(names_by_inode, GINT_TO_POINTER(inode));
+         }
+
+         if ((s = rmr_at_iter(k, keylen, iter, dirpath, dirpath_len,
+                              dirpath_cap, *name_max, db, batch)))
+            return s;
+      }
 
       leveldb_iter_next(iter);
       leveldb_iter_get_error(iter, &err);
@@ -510,6 +554,23 @@ static int go(
    }
    g_hash_table_destroy(names);
    leveldb_iter_destroy(iter);
+
+   GHashTableIter hiter;
+   g_hash_table_iter_init(&hiter, names_by_inode);
+   for (gpointer k, v; g_hash_table_iter_next(&hiter, &k, &v);) {
+      const struct seen_name *sn = v;
+      if (!sn->new)
+         continue;
+
+      fputs(sn->new == NEW ? "A " : "M ", stdout);
+      if (**dirpath) {
+         fputs(*dirpath, stdout);
+         putchar('/');
+      }
+      fwrite(sn->name, 1, sn->len, stdout);
+      putchar('\n');
+   }
+   g_hash_table_destroy(names_by_inode);
 
    leveldb_write(db, wopts, batch, &err);
    if (err)
@@ -594,7 +655,7 @@ static int rmr_at_iter(
    const char *name = key + sizeof (ino_t);
    const size_t name_len = keylen - sizeof (ino_t);
 
-   fputs("R ", stdout);
+   fputs("D ", stdout);
 
    leveldb_writebatch_delete(batch, key, keylen);
 
