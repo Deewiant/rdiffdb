@@ -110,10 +110,14 @@ int main(int argc, char **argv) {
    char *key = NULL;
    size_t keycap = 0;
 
-   return go(&dirpath, 0, &dirpath_cap, root_fd, 0, root_dir, &entry,
-             &name_max, &link_target_buf, &link_target_buf_cap, &seen_devs,
-             &seen_devs_count, &seen_devs_cap, &key, &keycap, &val, &valcap,
-             db);
+   const int s =
+      go(&dirpath, 0, &dirpath_cap, root_fd, 0, root_dir, &entry,
+         &name_max, &link_target_buf, &link_target_buf_cap, &seen_devs,
+         &seen_devs_count, &seen_devs_cap, &key, &keycap, &val, &valcap,
+         db);
+   if (s)
+      return s;
+   leveldb_close(db);
 }
 
 static int go(
