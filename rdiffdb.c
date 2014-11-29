@@ -52,6 +52,30 @@ static gboolean len_str_equal(gconstpointer p1, gconstpointer p2) {
               ls1->len);
 }
 
+static int write_name_to_dirpath(
+   const char *name, const size_t name_len, size_t *ppath_len,
+   char **dirpath, const size_t dirpath_len, size_t *dirpath_cap,
+   const size_t name_max)
+{
+   const bool need_slash = dirpath_len != 0;
+   const size_t dir_slashed_len = dirpath_len + (need_slash ? 1 : 0);
+   const size_t path_len = *ppath_len = dir_slashed_len + name_len;
+   if (path_len >= *dirpath_cap) {
+      *dirpath_cap = path_len + 1 + name_max;
+      char *p = realloc(*dirpath, *dirpath_cap);
+      if (!p) {
+         perror("realloc");
+         return 4;
+      }
+      *dirpath = p;
+   }
+   if (need_slash)
+      (*dirpath)[dirpath_len] = '/';
+   memcpy(*dirpath + dir_slashed_len, name, name_len);
+   (*dirpath)[path_len] = '\0';
+   return 0;
+}
+
 static int fail_act(const char *action, const char *errmsg) {
    fprintf(stderr, "Error %s: %s\n", action, errmsg);
    return 4;
@@ -70,7 +94,13 @@ static int go(
 
 static int rmr(
    ino_t dir_inode, char **dirpath, const size_t dirpath_len,
-   size_t *dirpath_cap, leveldb_t *db, leveldb_writebatch_t *batch);
+   size_t *dirpath_cap, const size_t name_max, leveldb_t *db,
+   leveldb_writebatch_t *batch);
+
+static int rmr_at_iter(
+   const char *key, const size_t keylen, const leveldb_iterator_t *iter,
+   char **dirpath, const size_t dirpath_len, size_t *dirpath_cap,
+   const size_t name_max, leveldb_t *db, leveldb_writebatch_t *batch);
 
 int main(int argc, char **argv) {
    if (argc != 2) {
@@ -268,23 +298,12 @@ static int go(
       size_t entry_path_len;
       if (S_ISDIR(st.st_mode)) {
          // Reäppropriate *dirpath as a buffer for this entry's path.
-         const bool need_slash = dirpath_len != 0;
-         const size_t dir_slashed_len = dirpath_len + (need_slash ? 1 : 0);
-         entry_path_len = dir_slashed_len + entry_name_len;
-         if (entry_path_len >= *dirpath_cap) {
-            *dirpath_cap = entry_path_len + 1 + *name_max;
-            char *p = realloc(*dirpath, *dirpath_cap);
-            if (!p) {
-               perror("realloc");
-               return 4;
-            }
-            *dirpath = p;
-         }
+         s = write_name_to_dirpath(entry->d_name, entry_name_len,
+                                   &entry_path_len, dirpath, dirpath_len,
+                                   dirpath_cap, *name_max);
+         if (s)
+            return s;
          entry_path = *dirpath;
-         if (need_slash)
-            entry_path[dirpath_len] = '/';
-         memcpy(entry_path + dir_slashed_len, entry->d_name, entry_name_len);
-         entry_path[dir_slashed_len + entry_name_len] = '\0';
 
          if (st.st_ino == 0) {
             fprintf(stderr, "Directory '%s' has unsupported inode value 0\n",
@@ -476,53 +495,13 @@ static int go(
       if (memcmp(k, &dir_inode, sizeof dir_inode))
          break;
 
-      const char *name = k + sizeof dir_inode;
-      const size_t name_len = keylen - sizeof dir_inode;
+      const struct len_str ls =
+         { keylen - sizeof dir_inode, .p = k + sizeof dir_inode };
 
-      const struct len_str ls = { name_len, .p = name };
-      if (!g_hash_table_contains(names, &ls)) {
-         fputs("R ", stdout);
-
-         leveldb_writebatch_delete(batch, k, keylen);
-
-         size_t vallen;
-         const char *valbuf = leveldb_iter_value(iter, &vallen);
-         const struct db_val *val = (struct db_val*)valbuf;
-
-         if (S_ISDIR(val->mode)) {
-            const bool need_slash = dirpath_len != 0;
-            const size_t dir_slashed_len = dirpath_len + (need_slash ? 1 : 0);
-            const size_t path_len = dir_slashed_len + name_len;
-            if (path_len >= *dirpath_cap) {
-               *dirpath_cap = path_len + 1 + *name_max;
-               char *p = realloc(*dirpath, *dirpath_cap);
-               if (!p) {
-                  perror("realloc");
-                  return 4;
-               }
-               *dirpath = p;
-            }
-            char *path = *dirpath;
-            if (need_slash)
-               path[dirpath_len] = '/';
-            memcpy(path + dir_slashed_len, name, name_len);
-            path[dir_slashed_len + name_len] = '\0';
-
-            fputs(path, stdout);
-            putchar('\n');
-            s = rmr(val->inode, dirpath, path_len, dirpath_cap, db, batch);
-            if (s)
-               return s;
-            (*dirpath)[dirpath_len] = '\0';
-         } else {
-            if (**dirpath) {
-               fputs(*dirpath, stdout);
-               putchar('/');
-            }
-            fwrite(name, 1, name_len, stdout);
-            putchar('\n');
-         }
-      }
+      if (!g_hash_table_contains(names, &ls) &&
+          (s = rmr_at_iter(k, keylen, iter, dirpath, dirpath_len, dirpath_cap,
+                           *name_max, db, batch)))
+         return s;
 
       leveldb_iter_next(iter);
       leveldb_iter_get_error(iter, &err);
@@ -573,7 +552,8 @@ static int go(
 
 static int rmr(
    ino_t dir_inode, char **dirpath, const size_t dirpath_len,
-   size_t *dirpath_cap, leveldb_t *db, leveldb_writebatch_t *batch)
+   size_t *dirpath_cap, const size_t name_max, leveldb_t *db,
+   leveldb_writebatch_t *batch)
 {
    int s;
    char *err = NULL;
@@ -593,50 +573,9 @@ static int rmr(
       if (memcmp(key, &dir_inode, sizeof dir_inode))
          break;
 
-      const char *name = key + sizeof dir_inode;
-      const size_t name_len = keylen - sizeof dir_inode;
-
-      fputs("R ", stdout);
-
-      leveldb_writebatch_delete(batch, key, keylen);
-
-      size_t vallen;
-      const char *valbuf = leveldb_iter_value(iter, &vallen);
-      const struct db_val *val = (struct db_val*)valbuf;
-
-      if (S_ISDIR(val->mode)) {
-         const bool need_slash = dirpath_len != 0;
-         const size_t dir_slashed_len = dirpath_len + (need_slash ? 1 : 0);
-         const size_t path_len = dir_slashed_len + name_len;
-         if (path_len >= *dirpath_cap) {
-            *dirpath_cap *= 2;
-            char *p = realloc(*dirpath, *dirpath_cap);
-            if (!p) {
-               perror("realloc");
-               return 4;
-            }
-            *dirpath = p;
-         }
-         char *path = *dirpath;
-         if (need_slash)
-            path[dirpath_len] = '/';
-         memcpy(path + dir_slashed_len, name, name_len);
-         path[dir_slashed_len + name_len] = '\0';
-
-         fputs(path, stdout);
-         putchar('\n');
-         s = rmr(val->inode, dirpath, path_len, dirpath_cap, db, batch);
-         if (s)
-            return s;
-         (*dirpath)[dirpath_len] = '\0';
-      } else {
-         if (**dirpath) {
-            fputs(*dirpath, stdout);
-            putchar('/');
-         }
-         fwrite(name, 1, name_len, stdout);
-         putchar('\n');
-      }
+      if ((s = rmr_at_iter(key, keylen, iter, dirpath, dirpath_len,
+                           dirpath_cap, name_max, db, batch)))
+         return s;
 
       leveldb_iter_next(iter);
       leveldb_iter_get_error(iter, &err);
@@ -644,5 +583,44 @@ static int rmr(
          return fail_act("nexting iterator", err);
    }
    leveldb_iter_destroy(iter);
+   return 0;
+}
+
+static int rmr_at_iter(
+   const char *key, const size_t keylen, const leveldb_iterator_t *iter,
+   char **dirpath, const size_t dirpath_len, size_t *dirpath_cap,
+   const size_t name_max, leveldb_t *db, leveldb_writebatch_t *batch)
+{
+   const char *name = key + sizeof (ino_t);
+   const size_t name_len = keylen - sizeof (ino_t);
+
+   fputs("R ", stdout);
+
+   leveldb_writebatch_delete(batch, key, keylen);
+
+   size_t vallen;
+   const char *valbuf = leveldb_iter_value(iter, &vallen);
+   const struct db_val *val = (struct db_val*)valbuf;
+
+   if (S_ISDIR(val->mode)) {
+      size_t path_len;
+      int s = write_name_to_dirpath(name, name_len, &path_len, dirpath,
+                                    dirpath_len, dirpath_cap, name_max);
+      if (s)
+         return s;
+      fputs(*dirpath, stdout);
+      putchar('\n');
+      s = rmr(val->inode, dirpath, path_len, dirpath_cap, name_max, db, batch);
+      if (s)
+         return s;
+      (*dirpath)[dirpath_len] = '\0';
+   } else {
+      if (**dirpath) {
+         fputs(*dirpath, stdout);
+         putchar('/');
+      }
+      fwrite(name, 1, name_len, stdout);
+      putchar('\n');
+   }
    return 0;
 }
