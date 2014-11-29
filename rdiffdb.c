@@ -117,6 +117,8 @@ static int go(
    ino_t *inodes = NULL;
    size_t inodes_len = 0, inodes_cap = 0;
 
+   int s;
+
    for (;;) {
       struct dirent *p;
       if (readdir_r(dir, entry, &p)) {
@@ -221,11 +223,6 @@ static int go(
          break;
       }
 
-      if (fd != -1 && !S_ISDIR(st.st_mode)) {
-         // We only needed it for the fstat, so get rid of it.
-         close(fd);
-      }
-
       char *entry_path = NULL;
       size_t entry_path_len;
       if (S_ISDIR(st.st_mode)) {
@@ -252,9 +249,12 @@ static int go(
                     entry_path);
             return 1;
          }
+      } else if (fd != -1) {
+         // We only needed it for the fstat, so get rid of it.
+         close(fd);
       }
 
-      size_t keylen = entry_name_len + sizeof dir_inode;
+      const size_t keylen = entry_name_len + sizeof dir_inode;
       char *key = malloc(keylen);
       if (!key) {
          perror("malloc");
@@ -364,10 +364,9 @@ static int go(
          }
       }
 
-      int s = go(entry_path, entry_path_len, dirpath_cap, fd, st.st_ino,
-                 entry_dir, entry, name_max, entry_link_target,
-                 entry_link_target_cap, seen_devs, seen_devs_count,
-                 seen_devs_cap, db);
+      s = go(entry_path, entry_path_len, dirpath_cap, fd, st.st_ino, entry_dir,
+             entry, name_max, entry_link_target, entry_link_target_cap,
+             seen_devs, seen_devs_count, seen_devs_cap, db);
       if (s)
          return s;
       closedir(entry_dir);
@@ -395,8 +394,7 @@ static int go(
 
       size_t vallen;
       const char *valbuf = leveldb_iter_value(iter, &vallen);
-
-      struct db_val *val = (struct db_val*)valbuf;
+      const struct db_val *val = (struct db_val*)valbuf;
 
       bool found = false;
       for (size_t i = 0; i < inodes_len; ++i) {
@@ -408,11 +406,8 @@ static int go(
 
       if (!found) {
          leveldb_writebatch_delete(batch, key, keylen);
-         if (S_ISDIR(val->mode)) {
-            int s = rmr(val->inode, db, batch);
-            if (s)
-               return s;
-         }
+         if (S_ISDIR(val->mode) && (s = rmr(val->inode, db, batch)))
+            return s;
       }
 
       leveldb_iter_next(iter);
@@ -432,6 +427,7 @@ static int go(
 }
 
 static int rmr(ino_t dir_inode, leveldb_t *db, leveldb_writebatch_t *batch) {
+   int s;
    char *err = NULL;
 
    leveldb_iterator_t *iter = leveldb_create_iterator(db, ropts);
@@ -451,15 +447,11 @@ static int rmr(ino_t dir_inode, leveldb_t *db, leveldb_writebatch_t *batch) {
 
       size_t vallen;
       const char *valbuf = leveldb_iter_value(iter, &vallen);
-
-      struct db_val *val = (struct db_val*)valbuf;
+      const struct db_val *val = (struct db_val*)valbuf;
 
       leveldb_writebatch_delete(batch, key, keylen);
-      if (S_ISDIR(val->mode)) {
-         int s = rmr(val->inode, db, batch);
-         if (s)
-            return s;
-      }
+      if (S_ISDIR(val->mode) && (s = rmr(val->inode, db, batch)))
+         return s;
 
       leveldb_iter_next(iter);
       leveldb_iter_get_error(iter, &err);
