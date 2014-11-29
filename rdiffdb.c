@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <glib.h>
 #include <leveldb/c.h>
 
 struct db_val {
@@ -130,8 +131,8 @@ static int go(
 {
    leveldb_writebatch_t *batch = leveldb_writebatch_create();
 
-   ino_t *inodes = NULL;
-   size_t inodes_len = 0, inodes_cap = 0;
+   GHashTable *names =
+      g_hash_table_new_full(g_str_hash, g_str_equal, free, NULL);
 
    int s;
 
@@ -159,15 +160,12 @@ static int go(
          entry_name_len = (int)len;
       }
 
-      if (inodes_len == inodes_cap) {
-         inodes_cap = 2*inodes_cap + 1024;
-         inodes = realloc(inodes, inodes_cap * sizeof *inodes);
-         if (!inodes) {
-            perror("realloc");
-            return 4;
-         }
+      char *dup = strdup(entry->d_name);
+      if (!dup) {
+         perror("strdup");
+         return 4;
       }
-      inodes[inodes_len++] = entry->d_ino;
+      g_hash_table_add(names, dup);
 
       struct stat st;
       int fd = -1;
@@ -450,19 +448,25 @@ static int go(
       if (memcmp(k, &dir_inode, sizeof dir_inode))
          break;
 
-      size_t vallen;
-      const char *valbuf = leveldb_iter_value(iter, &vallen);
-      const struct db_val *val = (struct db_val*)valbuf;
-
-      bool found = false;
-      for (size_t i = 0; i < inodes_len; ++i) {
-         if (inodes[i] == val->inode) {
-            found = true;
-            break;
+      // g_hash_table_contains needs a null-terminated string...
+      const size_t namesz = keylen - sizeof dir_inode + 1;
+      if (namesz > *keycap) {
+         *keycap = namesz;
+         char *p = realloc(*key, *keycap);
+         if (!p) {
+            perror("realloc");
+            return 4;
          }
+         *key = p;
       }
+      char *name = *key;
+      memcpy(name, k + sizeof dir_inode, namesz - 1);
+      name[namesz - 1] = '\0';
 
-      if (!found) {
+      if (!g_hash_table_contains(names, name)) {
+         size_t vallen;
+         const char *valbuf = leveldb_iter_value(iter, &vallen);
+         const struct db_val *val = (struct db_val*)valbuf;
 #if defined(RDIFFDB_DEBUG) && RDIFFDB_DEBUG > 0
          printf("\tdeleted dir %ju: entry %ju '%.*s'\n",
                 (uintmax_t)dir_inode, (uintmax_t)val->inode,
@@ -478,7 +482,7 @@ static int go(
       if (err)
          return fail_act("nexting iterator", err);
    }
-   free(inodes);
+   g_hash_table_destroy(names);
    leveldb_iter_destroy(iter);
 
    leveldb_write(db, wopts, batch, &err);
