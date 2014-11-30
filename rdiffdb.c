@@ -102,17 +102,18 @@ static int go(
    struct dirent **entry, long *name_max, char **entry_link_target,
    size_t *entry_link_target_cap, dev_t **seen_devs, size_t *seen_devs_count,
    size_t *seen_devs_cap, char **key, size_t *keycap, struct db_val **newval,
-   size_t *newvalcap, leveldb_t *db);
+   size_t *newvalcap, GHashTable *all_inodes, leveldb_t *db);
 
 static int rmr(
    ino_t dir_inode, char **dirpath, const size_t dirpath_len,
-   size_t *dirpath_cap, const size_t name_max, leveldb_t *db,
-   leveldb_writebatch_t *batch);
+   size_t *dirpath_cap, const size_t name_max, bool actually_delete,
+   GHashTable *all_inodes, leveldb_t *db, leveldb_writebatch_t *batch);
 
 static int rmr_at_iter(
    const char *key, const size_t keylen, const leveldb_iterator_t *iter,
    char **dirpath, const size_t dirpath_len, size_t *dirpath_cap,
-   const size_t name_max, leveldb_t *db, leveldb_writebatch_t *batch);
+   const size_t name_max, bool actually_delete, GHashTable *all_inodes,
+   leveldb_t *db, leveldb_writebatch_t *batch);
 
 int main(int argc, char **argv) {
    if (argc != 2) {
@@ -178,11 +179,13 @@ int main(int argc, char **argv) {
    char *key = NULL;
    size_t keycap = 0;
 
+   GHashTable *all_inodes = g_hash_table_new(NULL, NULL);
+
    const int s =
       go(&dirpath, 0, &dirpath_cap, root_fd, 0, root_dir, false, &entry,
          &name_max, &link_target_buf, &link_target_buf_cap, &seen_devs,
          &seen_devs_count, &seen_devs_cap, &key, &keycap, &val, &valcap,
-         db);
+         all_inodes, db);
    if (s)
       return s;
    leveldb_close(db);
@@ -194,7 +197,7 @@ static int go(
    struct dirent **pentry, long *name_max, char **entry_link_target,
    size_t *entry_link_target_cap, dev_t **pseen_devs, size_t *seen_devs_count,
    size_t *seen_devs_cap, char **key, size_t *keycap, struct db_val **newval,
-   size_t *newvalcap, leveldb_t *db)
+   size_t *newvalcap, GHashTable *all_inodes, leveldb_t *db)
 {
    leveldb_writebatch_t *batch = leveldb_writebatch_create();
 
@@ -237,6 +240,9 @@ static int go(
       ls->len = entry_name_len;
       memcpy(ls->str, entry->d_name, ls->len);
       g_hash_table_add(names, ls);
+
+      g_hash_table_insert(all_inodes, GINT_TO_POINTER(entry->d_ino),
+                          GINT_TO_POINTER(dir_inode));
 
       struct stat st;
       int fd = -1;
@@ -489,7 +495,7 @@ static int go(
       s = go(dirpath, entry_path_len, dirpath_cap, fd, st.st_ino, entry_dir,
              !valbuf, pentry, name_max, entry_link_target,
              entry_link_target_cap, pseen_devs, seen_devs_count, seen_devs_cap,
-             key, keycap, newval, newvalcap, db);
+             key, keycap, newval, newvalcap, all_inodes, db);
       if (s)
          return s;
       closedir(entry_dir);
@@ -543,7 +549,8 @@ static int go(
          }
 
          if ((s = rmr_at_iter(k, keylen, iter, dirpath, dirpath_len,
-                              dirpath_cap, *name_max, db, batch)))
+                              dirpath_cap, *name_max, true, all_inodes, db,
+                              batch)))
             return s;
       }
 
@@ -613,8 +620,8 @@ static int go(
 
 static int rmr(
    ino_t dir_inode, char **dirpath, const size_t dirpath_len,
-   size_t *dirpath_cap, const size_t name_max, leveldb_t *db,
-   leveldb_writebatch_t *batch)
+   size_t *dirpath_cap, const size_t name_max, bool actually_delete,
+   GHashTable *all_inodes, leveldb_t *db, leveldb_writebatch_t *batch)
 {
    int s;
    char *err = NULL;
@@ -635,7 +642,8 @@ static int rmr(
          break;
 
       if ((s = rmr_at_iter(key, keylen, iter, dirpath, dirpath_len,
-                           dirpath_cap, name_max, db, batch)))
+                           dirpath_cap, name_max, actually_delete, all_inodes,
+                           db, batch)))
          return s;
 
       leveldb_iter_next(iter);
@@ -650,18 +658,25 @@ static int rmr(
 static int rmr_at_iter(
    const char *key, const size_t keylen, const leveldb_iterator_t *iter,
    char **dirpath, const size_t dirpath_len, size_t *dirpath_cap,
-   const size_t name_max, leveldb_t *db, leveldb_writebatch_t *batch)
+   const size_t name_max, bool actually_delete, GHashTable *all_inodes,
+   leveldb_t *db, leveldb_writebatch_t *batch)
 {
-   const char *name = key + sizeof (ino_t);
-   const size_t name_len = keylen - sizeof (ino_t);
-
-   fputs("D ", stdout);
-
-   leveldb_writebatch_delete(batch, key, keylen);
-
    size_t vallen;
    const char *valbuf = leveldb_iter_value(iter, &vallen);
    const struct db_val *val = (struct db_val*)valbuf;
+
+   // If we've seen this inode with the same parent inode previously, i.e. this
+   // entry (or one of its parents) has been moved to another location, don't
+   // delete it from the DB.
+   if (actually_delete)
+      actually_delete =
+         g_hash_table_lookup(all_inodes, GINT_TO_POINTER(val->inode)) !=
+            GINT_TO_POINTER(*(const ino_t*)key);
+
+   fputs("D ", stdout);
+
+   const char *name = key + sizeof (ino_t);
+   const size_t name_len = keylen - sizeof (ino_t);
 
    if (S_ISDIR(val->mode)) {
       size_t path_len;
@@ -671,8 +686,8 @@ static int rmr_at_iter(
          return s;
       fputs(*dirpath, stdout);
       putchar('\n');
-      s = rmr(val->inode, dirpath, path_len, dirpath_cap, name_max, db, batch);
-      if (s)
+      if ((s = rmr(val->inode, dirpath, path_len, dirpath_cap, name_max,
+                   actually_delete, all_inodes, db, batch)))
          return s;
       (*dirpath)[dirpath_len] = '\0';
    } else {
@@ -683,5 +698,9 @@ static int rmr_at_iter(
       fwrite(name, 1, name_len, stdout);
       putchar('\n');
    }
+
+   if (actually_delete)
+      leveldb_writebatch_delete(batch, key, keylen);
+
    return 0;
 }
