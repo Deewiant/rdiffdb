@@ -201,8 +201,7 @@ static int go(
    GHashTable *names =
       g_hash_table_new_full(len_str_hash, len_str_equal, free, NULL);
 
-   GHashTable *names_by_inode =
-      g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, free);
+   GHashTable *names_by_inode = g_hash_table_new_full(NULL, NULL, NULL, free);
 
    int s;
 
