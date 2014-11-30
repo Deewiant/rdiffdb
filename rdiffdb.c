@@ -357,10 +357,9 @@ static int go(
       struct db_val *val = (struct db_val*)valbuf;
 
       const bool entry_is_new =
-         dir_was_new ||
          !val ||
          st.st_ino != val->inode ||
-         // We don't care about permission changes.
+         // We don't care about permission (or ownership) changes.
          (st.st_mode & S_IFMT) != (val->mode & S_IFMT) ||
          st.st_size != val->size ||
          memcmp(&st.st_mtim, &val->mtime, sizeof st.st_mtim) ||
@@ -377,7 +376,7 @@ static int go(
       g_hash_table_insert(names_by_inode, GINT_TO_POINTER(entry->d_ino), sn);
 
 #if defined(RDIFFDB_DEBUG) && RDIFFDB_DEBUG > 0
-      if (entry_is_new) {
+      if (dir_was_new || entry_is_new) {
          if (entry_path)
             fputs(entry_path, stdout);
          else {
@@ -421,33 +420,47 @@ static int go(
       }
 #endif
 
-      if (!val) {
-         vallen = entry_link_len + sizeof *val;
-         if (vallen > *newvalcap) {
-            *newvalcap = vallen;
-            struct db_val *p = realloc(*newval, *newvalcap);
-            if (!p) {
-               perror("realloc");
-               return 4;
+      // Write the entry to the DB only if the entry would change at all. Since
+      // we store some things that we don't consider as differences from the
+      // reporting POV, this does some more checking.
+      const bool update_db =
+         entry_is_new ||
+         st.st_mode != val->mode ||
+         memcmp(&st.st_atim, &val->atime, sizeof st.st_atim) ||
+         memcmp(&st.st_ctim, &val->ctime, sizeof st.st_ctim) ||
+         st.st_uid != val->uid ||
+         st.st_gid != val->gid;
+
+      if (update_db) {
+         if (!val) {
+            vallen = entry_link_len + sizeof *val;
+            if (vallen > *newvalcap) {
+               *newvalcap = vallen;
+               struct db_val *p = realloc(*newval, *newvalcap);
+               if (!p) {
+                  perror("realloc");
+                  return 4;
+               }
+               *newval = p;
             }
-            *newval = p;
+            val = *newval;
          }
-         val = *newval;
+
+         val->inode = st.st_ino;
+         val->size = st.st_size;
+         val->mtime = st.st_mtim;
+         val->atime = st.st_atim;
+         val->ctime = st.st_ctim;
+         val->rdev = st.st_rdev;
+         val->link_target_len = entry_link_len;
+         val->mode = st.st_mode;
+         val->uid = st.st_uid;
+         val->gid = st.st_gid;
+         memcpy(val->link_target, *entry_link_target, entry_link_len);
+
+         leveldb_writebatch_put(batch, *key, keylen, (const char*)val, vallen);
       }
 
-      val->inode = st.st_ino;
-      val->size = st.st_size;
-      val->mtime = st.st_mtim;
-      val->atime = st.st_atim;
-      val->ctime = st.st_ctim;
-      val->rdev = st.st_rdev;
-      val->link_target_len = entry_link_len;
-      val->mode = st.st_mode;
-      val->uid = st.st_uid;
-      val->gid = st.st_gid;
-      memcpy(val->link_target, *entry_link_target, entry_link_len);
-
-      leveldb_writebatch_put(batch, *key, keylen, (const char*)val, vallen);
       if (valbuf)
          leveldb_free(valbuf);
 
