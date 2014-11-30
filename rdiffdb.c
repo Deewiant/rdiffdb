@@ -388,6 +388,8 @@ static int go(
             fputs(entry->d_name, stdout);
          }
          puts(" is new because:");
+         if (dir_was_new)
+            printf("\tparent dir was new\n");
          if (!val)
             printf("\twas not in DB\n");
          else {
