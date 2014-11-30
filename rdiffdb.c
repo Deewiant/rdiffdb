@@ -98,11 +98,11 @@ static leveldb_writeoptions_t *wopts;
 
 static int go(
    char **dirpath, const size_t dirpath_len, size_t *dirpath_cap,
-   const int dirfd, const ino_t dir_inode, DIR *dir, struct dirent **entry,
-   long *name_max, char **entry_link_target, size_t *entry_link_target_cap,
-   dev_t **seen_devs, size_t *seen_devs_count, size_t *seen_devs_cap,
-   char **key, size_t *keycap, struct db_val **newval, size_t *newvalcap,
-   leveldb_t *db);
+   const int dirfd, const ino_t dir_inode, DIR *dir, const bool dir_was_new,
+   struct dirent **entry, long *name_max, char **entry_link_target,
+   size_t *entry_link_target_cap, dev_t **seen_devs, size_t *seen_devs_count,
+   size_t *seen_devs_cap, char **key, size_t *keycap, struct db_val **newval,
+   size_t *newvalcap, leveldb_t *db);
 
 static int rmr(
    ino_t dir_inode, char **dirpath, const size_t dirpath_len,
@@ -179,7 +179,7 @@ int main(int argc, char **argv) {
    size_t keycap = 0;
 
    const int s =
-      go(&dirpath, 0, &dirpath_cap, root_fd, 0, root_dir, &entry,
+      go(&dirpath, 0, &dirpath_cap, root_fd, 0, root_dir, false, &entry,
          &name_max, &link_target_buf, &link_target_buf_cap, &seen_devs,
          &seen_devs_count, &seen_devs_cap, &key, &keycap, &val, &valcap,
          db);
@@ -190,11 +190,11 @@ int main(int argc, char **argv) {
 
 static int go(
    char **dirpath, const size_t dirpath_len, size_t *dirpath_cap,
-   const int dirfd, const ino_t dir_inode, DIR *dir, struct dirent **pentry,
-   long *name_max, char **entry_link_target, size_t *entry_link_target_cap,
-   dev_t **pseen_devs, size_t *seen_devs_count, size_t *seen_devs_cap,
-   char **key, size_t *keycap, struct db_val **newval, size_t *newvalcap,
-   leveldb_t *db)
+   const int dirfd, const ino_t dir_inode, DIR *dir, const bool dir_was_new,
+   struct dirent **pentry, long *name_max, char **entry_link_target,
+   size_t *entry_link_target_cap, dev_t **pseen_devs, size_t *seen_devs_count,
+   size_t *seen_devs_cap, char **key, size_t *keycap, struct db_val **newval,
+   size_t *newvalcap, leveldb_t *db)
 {
    leveldb_writebatch_t *batch = leveldb_writebatch_create();
 
@@ -351,6 +351,7 @@ static int go(
       struct db_val *val = (struct db_val*)valbuf;
 
       const bool entry_is_new =
+         dir_was_new ||
          !val ||
          st.st_ino != val->inode ||
          // We don't care about permission changes.
@@ -365,7 +366,7 @@ static int go(
 
       struct seen_name *sn = malloc(entry_name_len + sizeof *sn);
       sn->len = entry_name_len;
-      sn->new = !val ? NEW : entry_is_new ? MOD : OLD;
+      sn->new = (dir_was_new || !val) ? NEW : entry_is_new ? MOD : OLD;
       memcpy(sn->name, entry->d_name, entry_name_len);
       g_hash_table_insert(names_by_inode, GINT_TO_POINTER(entry->d_ino), sn);
 
@@ -486,9 +487,9 @@ static int go(
       }
 
       s = go(dirpath, entry_path_len, dirpath_cap, fd, st.st_ino, entry_dir,
-             pentry, name_max, entry_link_target, entry_link_target_cap,
-             pseen_devs, seen_devs_count, seen_devs_cap, key, keycap, newval,
-             newvalcap, db);
+             !valbuf, pentry, name_max, entry_link_target,
+             entry_link_target_cap, pseen_devs, seen_devs_count, seen_devs_cap,
+             key, keycap, newval, newvalcap, db);
       if (s)
          return s;
       closedir(entry_dir);
