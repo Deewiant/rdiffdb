@@ -138,24 +138,19 @@ int main(int argc, char **argv) {
 
    leveldb_options_destroy(opts);
 
-   const int root_fd = open(".", O_DIRECTORY | O_NOATIME | O_RDONLY);
-   if (root_fd == -1) {
-      perror("open('.')");
-      return 1;
-   }
-   DIR *root_dir = fdopendir(root_fd);
+   DIR *root_dir = fdopendir(AT_FDCWD);
    if (!root_dir) {
-      perror("open('.') && fdopendir('.')");
+      perror("fdopendir('.')");
       return 1;
    }
 
-   long name_max = fpathconf(root_fd, _PC_NAME_MAX);
+   long name_max = fpathconf(AT_FDCWD, _PC_NAME_MAX);
    if (name_max == -1)
       name_max = NAME_MAX;
    struct dirent *entry =
       malloc(offsetof(struct dirent, d_name) + name_max + 1);
 
-   const long path_max = fpathconf(root_fd, _PC_PATH_MAX);
+   const long path_max = fpathconf(AT_FDCWD, _PC_PATH_MAX);
    size_t dirpath_cap = path_max == -1 ? PATH_MAX : path_max;
    size_t link_target_buf_cap = dirpath_cap;
    size_t valcap = link_target_buf_cap + sizeof (struct db_val);
@@ -182,7 +177,7 @@ int main(int argc, char **argv) {
    GHashTable *all_inodes = g_hash_table_new(NULL, NULL);
 
    const int s =
-      go(&dirpath, 0, &dirpath_cap, root_fd, 0, root_dir, false, &entry,
+      go(&dirpath, 0, &dirpath_cap, AT_FDCWD, 0, root_dir, false, &entry,
          &name_max, &link_target_buf, &link_target_buf_cap, &seen_devs,
          &seen_devs_count, &seen_devs_cap, &key, &keycap, &val, &valcap,
          all_inodes, db);
