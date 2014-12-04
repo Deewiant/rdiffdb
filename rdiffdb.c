@@ -130,13 +130,14 @@ static int rmr_at_iter(
    leveldb_t *db, leveldb_writebatch_t *batch);
 
 int main(int argc, char **argv) {
-   if (argc != 2) {
-      fprintf(stderr, "Usage: %s dbfile\n",
+   if (!(argc >= 2 && argc <= 3)) {
+      fprintf(stderr, "Usage: %s dbfile [rootdir]\n",
               argc > 0 ? argv[0] : "rdiffdb");
       return 2;
    }
 
    const char *db_path = argv[1];
+   const char *rootdir = argc > 2 ? argv[2] : NULL;
 
    leveldb_options_t *opts = leveldb_options_create();
    leveldb_options_set_filter_policy(
@@ -149,12 +150,16 @@ int main(int argc, char **argv) {
       fprintf(stderr, "Error opening DB at '%s': %s\n", db_path, err);
       return 3;
    }
-
    leveldb_options_destroy(opts);
 
-   DIR *root_dir = fdopendir(AT_FDCWD);
+   if (rootdir && chdir(rootdir) == -1) {
+      fprintf(stderr, "chdir('%s'): %s\n", rootdir, strerror(errno));
+      return 1;
+   }
+
+   DIR *root_dir = opendir(".");
    if (!root_dir) {
-      perror("fdopendir('.')");
+      perror("opendir('.')");
       return 1;
    }
 
