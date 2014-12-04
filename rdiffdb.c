@@ -239,7 +239,7 @@ static int go(
       {
          const size_t len = strlen(entry->d_name);
          if (len > (size_t)INT_MAX) {
-            fprintf(stderr, "Name of inode %ju in '%s' too long %zd\n",
+            fprintf(stderr, "Name of inode %ju in '%s' too long %zu\n",
                     (uintmax_t)entry->d_ino, *dirpath, len);
             return 1;
          }
