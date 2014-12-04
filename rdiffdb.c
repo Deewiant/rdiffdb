@@ -16,6 +16,7 @@
 
 #include <glib.h>
 #include <leveldb/c.h>
+#include "marisa.h"
 
 #ifdef __clang__
 #pragma clang diagnostic push
@@ -113,10 +114,12 @@ static leveldb_writeoptions_t *wopts;
 static int go(
    char **dirpath, const size_t dirpath_len, size_t *dirpath_cap,
    const int dirfd, const ino_t dir_inode, DIR *dir, const bool dir_was_new,
-   struct dirent **entry, long *name_max, char **entry_link_target,
-   size_t *entry_link_target_cap, dev_t **seen_devs, size_t *seen_devs_count,
-   size_t *seen_devs_cap, char **key, size_t *keycap, struct db_val **newval,
-   size_t *newvalcap, GHashTable *all_inodes, leveldb_t *db);
+   const bool dir_was_included, struct dirent **pentry, long *name_max,
+   char **entry_link_target, size_t *entry_link_target_cap, dev_t **pseen_devs,
+   size_t *seen_devs_count, size_t *seen_devs_cap, char **key, size_t *keycap,
+   struct db_val **newval, size_t *newvalcap, const marisa_trie *inc,
+   const marisa_trie *exc, marisa_agent *agent, GHashTable *all_inodes,
+   leveldb_t *db);
 
 static int rmr(
    ino_t dir_inode, char **dirpath, const size_t dirpath_len,
@@ -130,14 +133,102 @@ static int rmr_at_iter(
    leveldb_t *db, leveldb_writebatch_t *batch);
 
 int main(int argc, char **argv) {
-   if (!(argc >= 2 && argc <= 3)) {
-      fprintf(stderr, "Usage: %s dbfile [rootdir]\n",
-              argc > 0 ? argv[0] : "rdiffdb");
+   if (!(argc >= 2 && argc <= 4)) {
+      fprintf(
+         stderr,
+         "Usage: %s dbfile [rootdir [include-exclude-file]]\n"
+         "\n"
+         "include-exclude-file is a file specifying paths relative to "
+         "rootdir, one per\nline, with an initial '- ' signifying exclusion. "
+         "(If you want to specify paths\ncontaining line breaks or starting "
+         "with '- ', you're out of luck.)\n",
+         argc > 0 ? argv[0] : "rdiffdb");
       return 2;
    }
 
    const char *db_path = argv[1];
    const char *rootdir = argc > 2 ? argv[2] : NULL;
+   const char *incexc_path = argc > 3 ? argv[3] : NULL;
+
+   marisa_trie *inc, *exc;
+   if (incexc_path) {
+      marisa_keyset *iks = marisa_keyset_init();
+      marisa_keyset *eks = marisa_keyset_init();
+      if (!iks || !eks) {
+         perror("marisa_keyset_init");
+         return 4;
+      }
+
+      FILE *incexc_file = fopen(incexc_path, "r");
+      if (!incexc_file) {
+         fprintf(stderr, "fopen('%s'): %s\n", incexc_path, strerror(errno));
+         return 3;
+      }
+      char *line = NULL;
+      size_t line_cap = 0;
+      for (;;) {
+         errno = 0;
+         ssize_t line_len = getline(&line, &line_cap, incexc_file);
+         if (line_len == -1)
+            break;
+
+         if (line_len && line[line_len-1] == '\n')
+            --line_len;
+
+         bool include = true;
+         uint8_t offset = 0;
+         if (line_len > 2 && !memcmp(line, "- ", 2 )) {
+            line_len -= 2;
+            offset = 2;
+            include = false;
+         }
+
+         if ((uintmax_t)SSIZE_MAX > (uintmax_t)UINT32_MAX &&
+             line_len > (ssize_t)UINT32_MAX)
+         {
+            fprintf(stderr, "Too large inclusion/exclusion path length %zd\n",
+                    line_len);
+            return 3;
+         }
+
+         marisa_keyset_push(include ? iks : eks,
+                            line + offset, (uint32_t)line_len);
+      }
+      if (errno) {
+         fprintf(stderr, "getline() from '%s': %s\n",
+                 incexc_path, strerror(errno));
+         return 3;
+      }
+      free(line);
+      fclose(incexc_file);
+
+      // These are probably quite small so don't bother with much caching.
+      inc = marisa_trie_init(iks, MARISA_MIN_NUM_TRIES | MARISA_TINY_CACHE);
+      if (!inc) {
+         perror("marisa_trie_init");
+         return 4;
+      }
+      marisa_keyset_free(iks);
+      exc = marisa_trie_init(eks, MARISA_MIN_NUM_TRIES | MARISA_TINY_CACHE);
+      if (!exc) {
+         perror("marisa_trie_init");
+         return 4;
+      }
+      marisa_keyset_free(eks);
+   } else {
+      marisa_keyset *ks = marisa_keyset_init();
+      if (!ks) {
+         perror("marisa_keyset_init");
+         return 4;
+      }
+      inc = marisa_trie_init(ks, 0);
+      exc = marisa_trie_init(ks, 0);
+      if (!inc || !exc) {
+         perror("marisa_trie_init");
+         return 4;
+      }
+      marisa_keyset_free(ks);
+   }
 
    leveldb_options_t *opts = leveldb_options_create();
    leveldb_options_set_filter_policy(
@@ -182,6 +273,12 @@ int main(int argc, char **argv) {
       return 4;
    }
 
+   marisa_agent *agent = marisa_agent_init();
+   if (!agent) {
+      perror("marisa_agent_init");
+      return 4;
+   }
+
    strcpy(dirpath, "");
 
    ropts = leveldb_readoptions_create();
@@ -196,10 +293,10 @@ int main(int argc, char **argv) {
    GHashTable *all_inodes = g_hash_table_new(NULL, NULL);
 
    const int s =
-      go(&dirpath, 0, &dirpath_cap, AT_FDCWD, 0, root_dir, false, &entry,
-         &name_max, &link_target_buf, &link_target_buf_cap, &seen_devs,
-         &seen_devs_count, &seen_devs_cap, &key, &keycap, &val, &valcap,
-         all_inodes, db);
+      go(&dirpath, 0, &dirpath_cap, AT_FDCWD, 0, root_dir, false,
+         marisa_trie_empty(inc), &entry, &name_max, &link_target_buf,
+         &link_target_buf_cap, &seen_devs, &seen_devs_count, &seen_devs_cap,
+         &key, &keycap, &val, &valcap, inc, exc, agent, all_inodes, db);
    if (s)
       return s;
    leveldb_close(db);
@@ -208,10 +305,12 @@ int main(int argc, char **argv) {
 static int go(
    char **dirpath, const size_t dirpath_len, size_t *dirpath_cap,
    const int dirfd, const ino_t dir_inode, DIR *dir, const bool dir_was_new,
-   struct dirent **pentry, long *name_max, char **entry_link_target,
-   size_t *entry_link_target_cap, dev_t **pseen_devs, size_t *seen_devs_count,
-   size_t *seen_devs_cap, char **key, size_t *keycap, struct db_val **newval,
-   size_t *newvalcap, GHashTable *all_inodes, leveldb_t *db)
+   const bool dir_was_included, struct dirent **pentry, long *name_max,
+   char **entry_link_target, size_t *entry_link_target_cap, dev_t **pseen_devs,
+   size_t *seen_devs_count, size_t *seen_devs_cap, char **key, size_t *keycap,
+   struct db_val **newval, size_t *newvalcap, const marisa_trie *inc,
+   const marisa_trie *exc, marisa_agent *agent, GHashTable *all_inodes,
+   leveldb_t *db)
 {
    leveldb_writebatch_t *batch = leveldb_writebatch_create();
 
@@ -222,7 +321,15 @@ static int go(
 
    int s;
 
-   for (;;) {
+   for (;; (*dirpath)[dirpath_len] = '\0') {
+
+      // Usually we've done the *dirpath reäppropriation (see below) by the
+      // time we want to 'continue;', which is why we reset it in the for loop
+      // directly, so we don't have to remember it separately. For those cases
+      // when we haven't yet done it, we don't bother doing the dead store and
+      // come straight here instead.
+      quick_continue:;
+
       struct dirent *entry;
       if (readdir_r(dir, *pentry, &entry)) {
          fprintf(stderr, "readdir_r('%s'): %s\n",
@@ -233,7 +340,7 @@ static int go(
          break;
 
       if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
-         continue;
+         goto quick_continue;
 
       int entry_name_len;
       {
@@ -244,6 +351,38 @@ static int go(
             return 1;
          }
          entry_name_len = (int)len;
+      }
+
+      // Reäppropriate *dirpath as a buffer for this entry's path.
+      size_t entry_path_len;
+      s = write_name_to_dirpath(entry->d_name, entry_name_len,
+                                &entry_path_len, dirpath, dirpath_len,
+                                dirpath_cap, *name_max);
+      if (s)
+         return s;
+      if (entry_path_len > (size_t)UINT32_MAX) {
+         fprintf(stderr, "Path to inode %ju in '%s' too long %zu\n",
+                 (uintmax_t)entry->d_ino, *dirpath, entry_path_len);
+         return 1;
+      }
+      const char *entry_path = *dirpath;
+
+      marisa_agent_set_query(agent, entry_path, (uint32_t)entry_path_len);
+      if (marisa_trie_lookup(exc, agent))
+         continue;
+
+      bool entry_included = dir_was_included;
+      if (!entry_included) {
+         marisa_agent_set_query(agent, entry_path, (uint32_t)entry_path_len);
+         if (!marisa_trie_predictive_search(inc, agent)) {
+            // We can't reach anything in our set of inclusions from this
+            // entry, so don't bother looking further into it.
+            continue;
+         }
+         const char *k;
+         uint32_t l;
+         marisa_agent_get_key(agent, &k, &l);
+         entry_included = l == entry_path_len && !memcmp(k, entry_path, l);
       }
 
       struct len_str *ls = calloc(1, entry_name_len + sizeof *ls);
@@ -328,17 +467,7 @@ static int go(
          break;
       }
 
-      char *entry_path = NULL;
-      size_t entry_path_len;
       if (S_ISDIR(st.st_mode)) {
-         // Reäppropriate *dirpath as a buffer for this entry's path.
-         s = write_name_to_dirpath(entry->d_name, entry_name_len,
-                                   &entry_path_len, dirpath, dirpath_len,
-                                   dirpath_cap, *name_max);
-         if (s)
-            return s;
-         entry_path = *dirpath;
-
          if (st.st_ino == 0) {
             fprintf(stderr, "Directory '%s' has unsupported inode value 0\n",
                     entry_path);
@@ -391,16 +520,7 @@ static int go(
 
 #if defined(RDIFFDB_DEBUG) && RDIFFDB_DEBUG > 0
       if (dir_was_new || entry_is_new) {
-         if (entry_path)
-            fputs(entry_path, stdout);
-         else {
-            if (**dirpath) {
-               fputs(*dirpath, stdout);
-               putchar('/');
-            }
-            fputs(entry->d_name, stdout);
-         }
-         puts(" is new because:");
+         printf("%s is new because:", entry_path);
          if (dir_was_new)
             printf("\tparent dir was new\n");
          if (!val)
@@ -522,13 +642,12 @@ static int go(
       }
 
       s = go(dirpath, entry_path_len, dirpath_cap, fd, st.st_ino, entry_dir,
-             !valbuf, pentry, name_max, entry_link_target,
+             !valbuf, entry_included, pentry, name_max, entry_link_target,
              entry_link_target_cap, pseen_devs, seen_devs_count, seen_devs_cap,
-             key, keycap, newval, newvalcap, all_inodes, db);
+             key, keycap, newval, newvalcap, inc, exc, agent, all_inodes, db);
       if (s)
          return s;
       closedir(entry_dir);
-      (*dirpath)[dirpath_len] = '\0';
    }
 
    // Delete any preëxisting entries in the DB that have disappeared from the
