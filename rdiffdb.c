@@ -17,6 +17,10 @@
 #include <glib.h>
 #include <leveldb/c.h>
 
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wpadded"
+#endif
 struct db_val {
    ino_t inode;
    off_t size;
@@ -28,6 +32,9 @@ struct db_val {
    gid_t gid;
    char link_target[];
 };
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
 
 // Stores a string either inline or not.
 struct len_str {
@@ -42,11 +49,18 @@ enum {
    MOD = 2,
 };
 
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wpadded"
+#endif
 struct seen_name {
    size_t len;
    uint8_t new;
    char name[];
 };
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
 
 static guint len_str_hash(gconstpointer p) {
    const struct len_str *ls = p;
