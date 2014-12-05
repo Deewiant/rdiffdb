@@ -119,7 +119,7 @@ static int go(
    size_t *seen_devs_count, size_t *seen_devs_cap, char **key, size_t *keycap,
    struct db_val **newval, size_t *newvalcap, const marisa_trie *inc,
    const marisa_trie *exc, marisa_agent *agent, GHashTable *all_inodes,
-   leveldb_t *db);
+   leveldb_t *db, const bool dry_run);
 
 static int rmr(
    ino_t dir_inode, char **dirpath, const size_t dirpath_len,
@@ -133,10 +133,10 @@ static int rmr_at_iter(
    leveldb_t *db, leveldb_writebatch_t *batch);
 
 int main(int argc, char **argv) {
-   if (!(argc >= 2 && argc <= 4)) {
+   if (!(argc >= 2 && argc <= 5)) {
       fprintf(
          stderr,
-         "Usage: %s dbfile [rootdir [include-exclude-file]]\n"
+         "Usage: %s dbfile [rootdir [include-exclude-file]] [--dry-run]\n"
          "\n"
          "include-exclude-file is a file specifying paths relative to "
          "rootdir, one per\nline, with an initial '- ' signifying exclusion. "
@@ -145,6 +145,10 @@ int main(int argc, char **argv) {
          argc > 0 ? argv[0] : "rdiffdb");
       return 2;
    }
+
+   const bool dry_run = argc > 2 && !strcmp(argv[argc-1], "--dry-run");
+   if (dry_run)
+      --argc;
 
    const char *db_path = argv[1];
    const char *rootdir = argc > 2 ? argv[2] : NULL;
@@ -282,7 +286,7 @@ int main(int argc, char **argv) {
    strcpy(dirpath, "");
 
    ropts = leveldb_readoptions_create();
-   wopts = leveldb_writeoptions_create();
+   wopts = dry_run ? NULL : leveldb_writeoptions_create();
 
    dev_t *seen_devs = NULL;
    size_t seen_devs_count = 0;
@@ -296,7 +300,8 @@ int main(int argc, char **argv) {
       go(&dirpath, 0, &dirpath_cap, AT_FDCWD, 0, root_dir, false,
          marisa_trie_empty(inc), &entry, &name_max, &link_target_buf,
          &link_target_buf_cap, &seen_devs, &seen_devs_count, &seen_devs_cap,
-         &key, &keycap, &val, &valcap, inc, exc, agent, all_inodes, db);
+         &key, &keycap, &val, &valcap, inc, exc, agent, all_inodes, db,
+         dry_run);
    if (s)
       return s;
    leveldb_close(db);
@@ -310,9 +315,9 @@ static int go(
    size_t *seen_devs_count, size_t *seen_devs_cap, char **key, size_t *keycap,
    struct db_val **newval, size_t *newvalcap, const marisa_trie *inc,
    const marisa_trie *exc, marisa_agent *agent, GHashTable *all_inodes,
-   leveldb_t *db)
+   leveldb_t *db, const bool dry_run)
 {
-   leveldb_writebatch_t *batch = leveldb_writebatch_create();
+   leveldb_writebatch_t *batch = dry_run ? NULL : leveldb_writebatch_create();
 
    GHashTable *names =
       g_hash_table_new_full(len_str_hash, len_str_equal, free, NULL);
@@ -565,7 +570,7 @@ static int go(
          st.st_uid != val->uid ||
          st.st_gid != val->gid;
 
-      if (update_db) {
+      if (update_db && !dry_run) {
          if (!val) {
             vallen = entry_link_len + sizeof *val;
             if (vallen > *newvalcap) {
@@ -644,7 +649,8 @@ static int go(
       s = go(dirpath, entry_path_len, dirpath_cap, fd, st.st_ino, entry_dir,
              !valbuf, entry_included, pentry, name_max, entry_link_target,
              entry_link_target_cap, pseen_devs, seen_devs_count, seen_devs_cap,
-             key, keycap, newval, newvalcap, inc, exc, agent, all_inodes, db);
+             key, keycap, newval, newvalcap, inc, exc, agent, all_inodes, db,
+             dry_run);
       if (s)
          return s;
       closedir(entry_dir);
@@ -697,7 +703,7 @@ static int go(
          }
 
          if ((s = rmr_at_iter(k, keylen, iter, dirpath, dirpath_len,
-                              dirpath_cap, *name_max, true, all_inodes, db,
+                              dirpath_cap, *name_max, !dry_run, all_inodes, db,
                               batch)))
             return s;
       }
@@ -727,10 +733,12 @@ static int go(
    }
    g_hash_table_destroy(names_by_inode);
 
-   leveldb_write(db, wopts, batch, &err);
-   if (err)
-      return fail_act("writing", err);
-   leveldb_writebatch_destroy(batch);
+   if (!dry_run) {
+      leveldb_write(db, wopts, batch, &err);
+      if (err)
+         return fail_act("writing", err);
+      leveldb_writebatch_destroy(batch);
+   }
 
 #if defined(RDIFFDB_DEBUG) && RDIFFDB_DEBUG > 1
    iter = leveldb_create_iterator(db, ropts);
